@@ -15,7 +15,7 @@
 	};
 
 	chosen {
-		bootargs = "panic=15 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/multirom/roms/nvleaf-0.0.2-dev/root";
+		bootargs = "panic=15 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/multirom/roms/nvleaf-0.0.2-dev/root";
 		/* NVIDIA moment. God why is the SHIELD bootloader like this ??? */
 		linux,initrd-start = <0x81680000>;
 		linux,initrd-end = <0x82800000>;
@@ -30,7 +30,7 @@
 		#size-cells = <2>;
 		ranges;
 
-		/* Could PROBABLY be optimized. */
+		/* 544 MB. Jeez. Could PROBABLY be optimized. */
 		firmware_reserved: firmware@de000000 {
 			reg = <0x0 0xde000000 0x0 0x22000000>;
 			no-map;
@@ -95,28 +95,10 @@
 		status = "okay";
 	};
 
-	// Power State Coordination Interface (PSCI)
-	psci {
-		compatible = "arm,psci-0.2";
-		method = "smc";
-	};
 	// CPUs
 	cpus {
 		cpu@0 {
 			vdd-cpu-supply = <&vdd_cpu>;
-			enable-method = "psci";
-		};
-
-		cpu@1 {
-			enable-method = "psci";
-		};
-
-		cpu@2 {
-			enable-method = "psci";
-		};
-
-		cpu@3 {
-			enable-method = "psci";
 		};
 	};
 	// Clock controller
