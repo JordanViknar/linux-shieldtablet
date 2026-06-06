@@ -1829,7 +1829,6 @@
 
 	// i2c@7000c700
 
-	// UNFINISHED
 	i2c@7000d000 {
 		status = "okay";
 		clock-frequency = <400000>;
@@ -1844,10 +1843,80 @@
 
 			ti,system-power-controller;
 
+			palmas_gpadc: adc {
+				compatible = "ti,palmas-gpadc";
+				interrupts = <18 IRQ_TYPE_NONE
+					      16 IRQ_TYPE_NONE
+					      17 IRQ_TYPE_NONE>;
+
+				ti,channel0-current-microamp = <5>;
+				ti,channel3-current-microamp = <400>;
+				ti,enable-channel3-dual-current;
+				ti,enable-extended-delay;
+
+				#io-channel-cells = <1>;
+			};
+
+			palmas_extcon: extcon {
+				compatible = "ti,palmas-usb-vid";
+
+				ti,enable-vbus-detection;
+				ti,enable-id-detection;
+
+				ti,wakeup;
+			};
+
 			palmas_gpio: gpio {
 				compatible = "ti,palmas-gpio";
 				gpio-controller;
 				#gpio-cells = <2>;
+			};
+
+			clk32kg_pmic: palmas-clk32kg@0 {
+				compatible = "ti,palmas-clk32kg";
+				#clock-cells = <0>;
+			};
+
+			// MIGHT NEED SOME CHANGES ?
+			pinmux {
+				compatible = "ti,tps65913-pinctrl";
+
+				pinctrl-names = "default";
+				pinctrl-0 = <&palmas_default>;
+
+				palmas_default: pinmux {
+					powergood {
+						pins = "powergood";
+						function = "powergood";
+					};
+
+					vac {
+						pins = "vac";
+						function = "vac";
+					};
+
+					pin_gpio0 {
+						pins = "gpio0";
+						function = "id";
+						bias-pull-up;
+					};
+
+					pin_gpio1 {
+						pins = "gpio1";
+						function = "gpio";
+						bias-disable;
+					};
+
+					pin_gpio6 {
+						pins = "gpio2", "gpio3", "gpio4", "gpio6", "gpio7";
+						function = "gpio";
+					};
+
+					pin_gpio5 {
+						pins = "gpio5";
+						function = "clk32kgaudio";
+					};
+				};
 			};
 
 			pmic {
