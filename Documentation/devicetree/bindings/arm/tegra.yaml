@@ -209,6 +209,10 @@ properties:
         items:
           - const: xiaomi,mocha
           - const: nvidia,tegra124
+      - description: NVIDIA SHIELD Tablet (TN8)
+        items:
+          - const: nvidia,tn8
+          - const: nvidia,tegra124
       - items:
           - enum:
               - nvidia,p2371-0000

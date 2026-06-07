@@ -4,7 +4,7 @@
 #include "tegra124.dtsi"
 
 / {
-	model = "NVIDIA SHIELD Tablet";
+	model = "NVIDIA SHIELD Tablet (TN8)";
 	compatible = "nvidia,tn8", "nvidia,tegra124";
 
 	aliases {
@@ -12,9 +12,16 @@
 
 		rtc0 = &palmas;
 		rtc1 = "/rtc@0,7000e000";
+
+		serial0 = &uartd; /* Console */
+
+		serial1 = &uarta;
+		serial2 = &uartb;
+		serial3 = &uartc;
 	};
 
 	chosen {
+		stdout-path = "serial0:115200n8";
 		bootargs = "panic=15 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/multirom/roms/nvleaf-0.0.2-dev/root";
 		/* NVIDIA moment. God why is the SHIELD bootloader like this ??? */
 		linux,initrd-start = <0x81680000>;
@@ -1704,6 +1711,30 @@
 		};
 	};
 
+	// UNKNOWN
+	uarta: serial@70006000 {
+		status = "okay";
+		compatible = "nvidia,tegra124-hsuart";
+	};
+
+	// UNKNOWN
+	uartb: serial@70006040 {
+		status = "okay";
+		compatible = "nvidia,tegra124-hsuart";
+	};
+
+	// UNKNOWN... Bluetooth ?
+	uartc: serial@70006200 {
+		status = "okay";
+		compatible = "nvidia,tegra124-hsuart";
+	};
+
+	// Console
+	uartd: serial@70006300 {
+		status = "okay";
+		compatible = "nvidia,tegra124-uart";
+	};
+
 	pwm@7000a000 {
 		status = "okay";
 	};
@@ -1790,17 +1821,6 @@
 			};
 		};
 
-		/*proximity@44 {
-			compatible = "azoteq,iqs253";
-			reg = <0x44>;
-
-			vddhi-supply = <&palmas_smps9_reg>;
-
-			rdy-gpio  = <&gpio TEGRA_GPIO(K, 5) GPIO_ACTIVE_LOW>;
-			wake-gpio = <&gpio TEGRA_GPIO(W, 3) GPIO_ACTIVE_LOW>;
-			sar-gpio  = <&gpio TEGRA_GPIO(I, 2) GPIO_ACTIVE_LOW>;
-		};*/
-
 		power-monitor@40 {
 			compatible = "ti,ina3221";
 			reg = <0x40>;
@@ -1827,7 +1847,15 @@
 		};
 	};
 
-	// i2c@7000c700
+	i2c@7000c500 {
+		status = "okay";
+		clock-frequency = <400000>;
+	};
+
+	i2c@7000c700 {
+		status = "okay";
+		clock-frequency = <100000>;
+	};
 
 	i2c@7000d000 {
 		status = "okay";
@@ -1957,7 +1985,7 @@
 					};
 
 					/* SoC core voltage (SMPS7, 0.7–1.4V) */
-					smps7 {
+					vdd_core: smps7 {
 						regulator-name = "vdd-core";
 						regulator-min-microvolt = <700000>;
 						regulator-max-microvolt = <1400000>;
@@ -2016,7 +2044,7 @@
 					};
 
 					/* Touch supply (LDO3, 3.0V) */
-					ldo3 {
+					ldo3_reg: ldo3 {
 						regulator-name = "vdd-touch";
 						regulator-min-microvolt = <3300000>;
 						regulator-max-microvolt = <3300000>;
@@ -2096,6 +2124,33 @@
 				interrupt-parent = <&palmas>;
 				interrupts = <8 0>;
 			};
+		};
+	};
+
+	i2c@7000d100 {
+		status = "okay";
+		clock-frequency = <400000>;
+	};
+
+	pmc@7000e400 {
+		// nvidia,invert-interrupt; --- Downstream uses it, but mainline gets crashed ?
+
+		/* --- VERIFY THE VALUES --- */
+		nvidia,suspend-mode = <1>;
+		nvidia,cpu-pwr-good-time = <500>;
+		nvidia,cpu-pwr-off-time = <300>;
+		nvidia,core-pwr-good-time = <3845 3845>;
+		nvidia,core-pwr-off-time = <2000>;
+		nvidia,core-power-req-active-high;
+		nvidia,sys-clock-req-active-high;
+		core-supply = <&vdd_core>;
+
+		/* Clear DEV_ON bit in DEV_CTRL register of TPS65913 PMIC  */
+		i2c-thermtrip {
+			nvidia,i2c-controller-id = <4>;
+			nvidia,bus-addr = <0x58>;
+			nvidia,reg-addr = <0xA0>;
+			nvidia,reg-data = <0x00>;
 		};
 	};
 
@@ -2886,6 +2941,7 @@
 		};
 	};
 
+	// SHOULD BE CHECKED
 	hda@70030000 {
 		status = "okay";
 	};
@@ -2967,7 +3023,7 @@
 		regulator-max-microvolt = <3300000>;
 		gpio = <&palmas_gpio 2 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
-		vin-supply = <&ldousb_reg>;
+		vin-supply = <&ldo3_reg>;
 	};
 };
 
