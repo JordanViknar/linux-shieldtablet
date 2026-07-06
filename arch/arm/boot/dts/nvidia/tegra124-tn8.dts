@@ -15,15 +15,16 @@
 
 	aliases {
 		mmc0 = &sdmmc4; /* eMMC */
+		mmc1 = &sdmmc1; /* WiFi */
 
 		rtc0 = &palmas;
 		rtc1 = "/rtc@0,7000e000";
 
 		serial0 = &uartd; /* Console */
+		serial1 = &uartc; /* Bluetooth */
 
-		serial1 = &uarta;
-		serial2 = &uartb;
-		serial3 = &uartc;
+		serial2 = &uarta;
+		serial3 = &uartb;
 	};
 
 	chosen {
@@ -129,10 +130,41 @@
 		compatible = "nvidia,tegra124-hsuart";
 	};
 
-	// UNKNOWN... Bluetooth ?
+	/* Bluetooth */
 	uartc: serial@70006200 {
+		compatible = "nvidia,tegra124-hsuart", "nvidia,tegra30-hsuart";
+		reset-names = "serial";
+		/delete-property/ reg-shift;
 		status = "okay";
-		compatible = "nvidia,tegra124-hsuart";
+
+		nvidia,adjust-baud-rates = <0 9600 100>,
+					   <9600 115200 200>,
+					   <1000000 4000000 136>;
+
+		/*
+			Will only function from a restart from downstream kernel for now.
+			
+			Note :
+			- Copy /system/etc/firmware/bcm43241.hcd into /lib/firmware/brcm/BCM4334B0.nvidia,tn8.hcd in initramfs.
+		*/
+		bluetooth {
+			compatible = "brcm,bcm4334-bt"; // It's technically a BCM43241B0
+			max-speed = <4000000>;
+
+			clocks = <&tegra_pmc TEGRA_PMC_CLK_BLINK>;
+			clock-names = "txco";
+
+			interrupt-parent = <&gpio>;
+			interrupts = <TEGRA_GPIO(U, 6) IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "host-wakeup";
+
+			device-wakeup-gpios = <&gpio TEGRA_GPIO(EE, 1) GPIO_ACTIVE_HIGH>;
+			shutdown-gpios = <&gpio TEGRA_GPIO(R, 1) GPIO_ACTIVE_HIGH>;
+			reset-gpios = <&gpio TEGRA_GPIO(X, 1) GPIO_ACTIVE_HIGH>;
+
+			vbat-supply = <&palmas_smps9_reg>;
+			vddio-supply = <&palmas_smps8_reg>;
+		};
 	};
 
 	// Console
@@ -557,6 +589,50 @@
 			nvidia,bus-addr = <0x58>;
 			nvidia,reg-addr = <0xA0>;
 			nvidia,reg-data = <0x00>;
+		};
+	};
+
+	brcm_wifi_pwrseq: pwrseq-wifi {
+		compatible = "mmc-pwrseq-simple";
+
+		clocks = <&tegra_pmc TEGRA_PMC_CLK_BLINK>;
+		clock-names = "ext_clock";
+
+		reset-gpios = <&gpio TEGRA_GPIO(X, 7) GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <300>;
+		power-off-delay-us = <300>;
+	};
+
+	/* Wi-Fi */
+	sdmmc1: mmc@700b0000 {
+		status = "okay";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		keep-power-in-suspend;
+		bus-width = <4>;
+		non-removable;
+
+		mmc-pwrseq = <&brcm_wifi_pwrseq>;
+		vmmc-supply = <&palmas_smps9_reg>;
+		vqmmc-supply = <&palmas_smps8_reg>;
+
+		/*
+			Will only function from a restart from downstream kernel for now.
+			
+			Note :
+			- Copy `/system/vendor/firmware/bcm43241/fw_bcmdhd.bin` into `/lib/firmware/brcm/brcmfmac43241b0-sdio.nvidia,tn8.bin` in initramfs.
+			- Copy `/data/misc/wifi/firmware/nvram.txt` into `/lib/firmware/brcm/brcmfmac43241b0-sdio.txt` in initramfs.
+			- clm_blob currently missing. Optional.
+		*/
+		wifi@1 {
+			compatible = "brcm,bcm4329-fmac"; // It's technically a BCM43241B0
+			reg = <1>;
+
+			interrupt-parent = <&gpio>;
+			interrupts = <TEGRA_GPIO(U, 5) IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "host-wake";
 		};
 	};
 
