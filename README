@@ -1,3 +1,67 @@
+Mainline Linux for the NVIDIA SHIELD Tablet (TN8)
+============
+
+This kernel is being tested exclusively on an NVIDIA SHIELD Tablet K1 with the
+NVIDIA SHIELD Android 5.0/L bootloader. It *should* work on other models, but
+not necessarily other bootloader versions. Use this kernel at your own risk,
+as it is in a very experimental state.
+
+In other words, when using this kernel, you agree to the possibility of hardware
+damage. I've had none so far, but cannot guarantee you won't.
+
+This port uses `tegra_defconfig` to store its default kernel configuration.
+
+Current Status
+-----------
+
+* CPU: Only one core active.
+* Display (tegradrm): Fully functional.
+* GPU (nouveau): Partially functional. Enough to render kmscube with some
+  temporary freezes.
+* Touchscreen: No driver in mainline.
+* Wi-Fi & Bluetooth (brcmfmac & hci_bcm): "Fully" functional. Reported as "Nvidia
+  Shield BCM43241B0" on my unit. Other units MIGHT have different chips.
+* Hardware keys (Power & Volume): Fully functional.
+
+Quirks
+-----------
+
+* Bootloader: Baking too many modules into the kernel itself will cause kernel
+  panics and initramfs failures on boot. Reason unknown.
+* Wi-Fi & Bluetooth: Requires firmware files inside initramfs. Requires booting
+  downstream kernel first, then directly restarting into mainline.
+* GPU: Requires firmware files inside initramfs.
+
+Credits
+-----------
+
+Previous mainline ports:
+
+* Alexandre Courbot, for his original basic Linux 3.17 mainline port, conveniently 
+  saved from deletion by Andrew Querol:
+  https://github.com/winsock/linux/tree/st8
+* Aaron Kling, for his more recent DTS for the NVIDIA SHIELD Tablet:
+  https://gitlab.incom.co/CM-Shield/android_hardware_nvidia_t124_lineage/-/blob/lineage-24.0/tegra124-tn8.dts
+  (Warning : Seemed to be partially incorrect. Did allow me to get the display
+  working without simple-framebuffer though, on top of being used as base.)
+
+Other mainline ports:
+
+* tegra124-xiaomi-mocha.dts: Similar device used for some comparisons and
+  general structure.
+* tegra114-roth.dts & tegra114-tn7.dts: NVIDIA devices with similarbootloaders.
+
+Downstream kernel:
+
+* The original Linux4Tegra port's downstream DTS was used as base :
+  https://xdaforums.com/t/linux4tegra-r23-1-r24-1-beta-for-the-shield-tablet.2985238/
+  https://github.com/bogsen/STLinux-Kernel
+  https://gist.github.com/JordanViknar/8fef373312b60890d718846927095e6b
+* LineageOS's downstream kernel for the NVIDIA SHIELD Tablet was also used as base :
+  https://github.com/LineageOS/android_kernel_nvidia_shield
+
+-----------------------------------------------
+
 Linux kernel
 ============
 
