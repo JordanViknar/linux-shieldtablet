@@ -6,7 +6,7 @@
 
 #include "tegra124.dtsi"
 
-#include "tegra124-tn8-emc.dtsi"
+// #include "tegra124-tn8-emc.dtsi" - Causes Nouveau issues. Needs fixing.
 #include "tegra124-tn8-pinmux.dtsi"
 
 / {
@@ -29,7 +29,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "panic=15 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/multirom/roms/nvleaf-0.0.2-dev/root";
+		bootargs = "panic=5 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/multirom/roms/nvleaf-0.0.2-dev/root";
 		/* NVIDIA moment. God why is the SHIELD bootloader like this ??? */
 		linux,initrd-start = <0x81680000>;
 		linux,initrd-end = <0x82800000>;
