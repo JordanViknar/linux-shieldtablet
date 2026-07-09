@@ -19,6 +19,7 @@ Current Status
 * GPU (nouveau): Partially functional. Enough to render kmscube with some
   temporary freezes.
 * Touchscreen: No driver in mainline.
+* Internal eMMC: Fully functional.
 * Wi-Fi & Bluetooth (brcmfmac & hci_bcm): "Fully" functional. Reported as "Nvidia
   Shield BCM43241B0" on my unit. Other units MIGHT have different chips.
 * Hardware keys (Power & Volume): Fully functional.
@@ -49,7 +50,7 @@ Other mainline ports:
 
 * tegra124-xiaomi-mocha.dts: Similar device used for some comparisons and
   general structure.
-* tegra114-roth.dts & tegra114-tn7.dts: NVIDIA devices with similarbootloaders.
+* tegra114-roth.dts & tegra114-tn7.dts: NVIDIA devices with similar bootloaders.
 
 Downstream kernel:
 
