@@ -10,7 +10,7 @@
 #include "tegra124-tn8-pinmux.dtsi"
 
 / {
-	model = "NVIDIA SHIELD Tablet (TN8)";
+	model = "NVIDIA SHIELD Tablet";
 	compatible = "nvidia,tn8", "nvidia,tegra124";
 
 	aliases {
@@ -29,7 +29,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "panic=5 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/Linux/current";
+		bootargs = "panic=5 loglevel=7 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/Linux/current";
 		/* NVIDIA moment. God why is the SHIELD bootloader like this ??? */
 		linux,initrd-start = <0x81680000>;
 		linux,initrd-end = <0x82800000>;
@@ -225,21 +225,22 @@
 		status = "okay";
 		clock-frequency = <100000>;
 
-		/*bat: battery-gauge@0b {
+		// max17048@36 mentioned in downstream DTS but disabled.
+
+		fuel_gauge: fuel-gauge@0b {
 			compatible = "onsemi,lc709203f";
 			reg = <0x0b>;
 
 			interrupt-parent = <&gpio>;
-			interrupts = <TEGRA_GPIO(Q, 5) GPIO_ACTIVE_LOW>;
+			interrupts = <TEGRA_GPIO(Q, 5) IRQ_TYPE_NONE>;
 
+			// Add monitored-battery ?
 			power-supplies = <&charger>;
 
-			onsemi,thermistor-beta = <0x0d6b>;
-			onsemi,alert-low-rsoc = <0x0>;
-			onsemi,alert-low-voltage = <0x0>;
-
-			#thermal-sensor-cells = <0>;
-		};*/
+			onsemi,thermistor-beta = <3435>;
+			onsemi,alert-low-rsoc = <0>;
+			onsemi,alert-low-voltage = <0>;
+		};
 
 		charger: charger@6b {
 			compatible = "ti,bq24193", "ti,bq24192";
@@ -249,6 +250,7 @@
 			interrupts = <TEGRA_GPIO(J, 0) GPIO_ACTIVE_LOW>;
 
 			omit-battery-class;
+			// Add monitored-battery ?
 
 			battery_charger: charger {
 				regulator-name = "batt_regulator";

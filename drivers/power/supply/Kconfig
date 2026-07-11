@@ -1165,4 +1165,14 @@ config MACSMC_POWER
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
+config FUEL_GAUGE_LC709203F
+	tristate "Onsemi LC709203F Fuel Gauge Driver"
+	depends on I2C && IIO
+	help
+	  Say Y here to enable support for the onsemi (ON Semiconductor)
+	  LC709203F fuel gauge, a battery monitor providing state-of-charge,
+	  voltage and temperature over I2C/SMBus.
+
+	  Driver can be built as a module (lc709203f).
+
 endif # POWER_SUPPLY
