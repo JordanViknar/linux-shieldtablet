@@ -14,15 +14,40 @@ This port uses `tegra_defconfig` to store its default kernel configuration.
 Current Status
 -----------
 
-* CPU: Only one core active.
-* Display (tegradrm): Fully functional.
-* GPU (nouveau): Partially functional. Enough to render kmscube with some
-  temporary freezes.
+Fully functional:
+
+* Display (using `tegradrm`)
+* Internal eMMC
+* Hardware keys (volume up, volume down, power)
+* Fuel gauge (using custom driver `lc709203f`)
+* Charger (using `bq24193`)
+* Power monitor (using `ina3221`)
+
+Fully functional, but with quirks:
+
+* Wi-Fi (using `brcmfmac`)
+* Bluetooth (using `hci_bcm`)
+
+Partially functional:
+
+* CPU: Only CPU0 can be currently used.
+* GPU (using `nouveau`): Works enough to render kmscube.
+
+Non-functional:
+
 * Touchscreen: No driver in mainline.
-* Internal eMMC: Fully functional.
-* Wi-Fi & Bluetooth (brcmfmac & hci_bcm): "Fully" functional. Reported as "Nvidia
-  Shield BCM43241B0" on my unit. Other units MIGHT have different chips.
-* Hardware keys (Power & Volume): Fully functional.
+
+Elements not listed above are either not tested/worked on yet, or not
+applicable to this device.
+
+Custom Drivers
+-----------
+
+Drivers that are unique to this kernel port and not mainlined:
+
+* Fuel gauge (lc709203f): Custom driver for the fuel gauge chip. Ported from
+  Zephyr RTOS. Needs more testing, but seems to work fine.
+  See `drivers/power/supply/lc709203f-fuel-gauge.c`
 
 Quirks
 -----------
