@@ -11,6 +11,8 @@ damage. I've had none so far, but cannot guarantee you won't.
 
 This port uses `tegra_defconfig` to store its default kernel configuration.
 
+Note: Compile with `-march=armv7ve -mtune=cortex-a15`.
+
 Current Status
 -----------
 
@@ -30,7 +32,7 @@ Fully functional, but with quirks:
 Partially functional:
 
 * CPU: Only CPU0 can be currently used.
-* Display (using `tegradrm`): Instability detected when long running.
+* Display (using `tegradrm`): Instability detected under high load.
 * GPU (using `nouveau`): Works enough to render kmscube.
 
 Non-functional:
