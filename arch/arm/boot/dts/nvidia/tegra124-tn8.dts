@@ -6,7 +6,7 @@
 
 #include "tegra124.dtsi"
 
-// #include "tegra124-tn8-emc.dtsi" - Causes Nouveau issues. Needs fixing.
+#include "tegra124-tn8-emc.dtsi"
 #include "tegra124-tn8-pinmux.dtsi"
 
 / {
