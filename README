@@ -18,6 +18,7 @@ Current Status
 
 Fully functional:
 
+* All CPU cores
 * Internal eMMC
 * Hardware keys (volume up, volume down, power)
 * Fuel gauge (using custom driver `lc709203f`)
@@ -31,7 +32,6 @@ Fully functional, but with quirks:
 
 Partially functional:
 
-* CPU: Only CPU0 can be currently used.
 * Display (using `tegradrm`): Instability detected under high load.
 * GPU (using `nouveau`): Works enough to render kmscube.
 
@@ -59,6 +59,16 @@ Quirks
 * Wi-Fi & Bluetooth: Requires firmware files inside initramfs. Requires booting
   downstream kernel first, then directly restarting into mainline.
 * GPU: Requires firmware files inside initramfs.
+
+Implementation Notes
+-----------
+
+* SMP: On the Android L bootloader (may not be exclusive to it), PSCI CPU_ON
+  claims success but never actually powers on CPU1-3. Worked around by using
+  a PSCI CPU_ON call on CPU0 (already running) purely to register the reset
+  vector with firmware, then powering CPU1-3 on directly via PMC instead of
+  PSCI, matching what the Tegra4Linux kernel does.
+  See `arch/arm/mach-tegra/reset.c` and `arch/arm/mach-tegra/platsmp.c`.
 
 Credits
 -----------

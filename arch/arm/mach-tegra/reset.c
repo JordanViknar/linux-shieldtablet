@@ -9,6 +9,7 @@
 #include <linux/cpumask.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/psci.h>
 
 #include <linux/firmware/trusted_foundations.h>
 
@@ -34,6 +35,30 @@ static void __init tegra_cpu_reset_handler_set(const u32 reset_address)
 		IO_ADDRESS(TEGRA_EXCEPTION_VECTORS_BASE + 0x100);
 	void __iomem *sb_ctrl = IO_ADDRESS(TEGRA_SB_BASE);
 	u32 reg;
+
+	if (psci_ops.cpu_on) {
+		/*
+		 * Normally we'd just write this address into a register
+		 * (below) to tell the hardware "wake CPUs up here". But on
+		 * the NVIDIA SHIELD Tablet's secure firmware, that write is
+		 * blocked - we tried it and read back a completely different
+		 * address than what we wrote. This is known to happen on the
+		 * Android L-era bootloader, though it might not be exclusive
+		 * to it.
+		 *
+		 * The workaround: ask firmware to set it for us instead, by
+		 * making a PSCI "turn on CPU 0" call. Yes, CPU 0 is already
+		 * on. We're not really turning it on - firmware just also
+		 * happens to save this address when we make this call, and
+		 * that's the only way we've found to give it the address.
+		 * The Tegra4Linux does the exact same thing.
+		 */
+		int ret = psci_ops.cpu_on(0, reset_address);
+
+		pr_debug("%s: primed reset vector via psci cpu_on(0, 0x%x), ret=%d\n",
+			 __func__, reset_address, ret);
+		return;
+	}
 
 	/*
 	 * NOTE: This must be the one and only write to the EVP CPU reset

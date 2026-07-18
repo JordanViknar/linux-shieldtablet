@@ -658,6 +658,22 @@
 		clock-output-names = "ref-oscillator";
 	};
 
+	psci {
+		compatible = "arm,psci";
+		method = "smc";
+		cpu_suspend = <0x84000001>;
+		cpu_on = <0x84000003>;
+	};
+
+	/*
+	 * A `psci` node is present in this file even though PSCI is NOT used to
+	 * power on CPU1-3 - on this board's (Android L) bootloader, PSCI CPU_ON
+	 * claims success but never actually powers them on. Do not remove the
+	 * psci node thinking it's unused: the kernel still needs it for one
+	 * thing - registering its reset vector with firmware, via a CPU_ON call
+	 * targeting CPU0 (already running) rather than the CPUs actually being
+	 * booted. Actual CPU1-3 bring-up happens directly via PMC instead.
+	 */
 	cpus {
 		cpu@0 {
 			vdd-cpu-supply = <&vdd_cpu>;

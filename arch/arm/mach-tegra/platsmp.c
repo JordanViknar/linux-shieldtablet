@@ -16,6 +16,7 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
+#include <linux/of.h>
 #include <linux/smp.h>
 
 #include <soc/tegra/flowctrl.h>
@@ -188,3 +189,23 @@ const struct smp_operations tegra_smp_ops __initconst = {
 	.cpu_die		= tegra_cpu_die,
 #endif
 };
+
+/*
+ * The NVIDIA SHIELD Tablet has a broken PSCI CPU_ON: it claims success
+ * but never actually powers on the other CPUs. This is known to affect
+ * devices on the Android L-era bootloader, though it might not be
+ * exclusive to it - newer bootloaders may or may not have a fixed TLK.
+ * So on this device we skip PSCI here and power CPU1-3 on ourselves the
+ * old-fashioned way, using tegra_smp_ops above.
+ *
+ * PSCI isn't useless here though - it's still needed for one other
+ * thing. See the comment in reset.c for that part.
+ */
+bool __init tegra_smp_init(void)
+{
+	if (!of_machine_is_compatible("nvidia,tn8"))
+		return false;
+
+	smp_set_ops(&tegra_smp_ops);
+	return true;
+}
