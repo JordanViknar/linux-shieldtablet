@@ -24,6 +24,7 @@ Fully functional:
 * Fuel gauge (using custom driver `lc709203f`)
 * Charger (using `bq24193`)
 * Power monitor (using `ina3221`)
+* Memory controller
 
 Fully functional, but with quirks:
 
@@ -69,6 +70,10 @@ Implementation Notes
   vector with firmware, then powering CPU1-3 on directly via PMC instead of
   PSCI, matching what the Tegra4Linux kernel does.
   See `arch/arm/mach-tegra/reset.c` and `arch/arm/mach-tegra/platsmp.c`.
+* Memory controller: Couldn't get some of the downstream kernel's values to
+  work on mainline. Using the values from Aaron Kling's `tegra124-ardbeg-emc.dtsi`
+  seems to be stable.
+  See `arch/arm/boot/dts/nvidia/tegra124-tn8-emc.dtsi`.
 
 Credits
 -----------
