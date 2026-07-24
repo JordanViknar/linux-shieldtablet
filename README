@@ -1,5 +1,5 @@
 Mainline Linux for the NVIDIA SHIELD Tablet (TN8)
-============
+=================================================
 
 This kernel is being tested exclusively on an NVIDIA SHIELD Tablet K1 with the
 NVIDIA SHIELD Android 5.0/L bootloader. It *should* work on other models, but
@@ -14,7 +14,7 @@ This port uses `tegra_defconfig` to store its default kernel configuration.
 Note: Compile with `-march=armv7ve -mtune=cortex-a15`.
 
 Current Status
------------
+--------------
 
 Fully functional:
 
@@ -26,14 +26,15 @@ Fully functional:
 * Power monitor (using `ina3221`)
 * Memory controller
 
-Fully functional, but with quirks:
+Fully functional, with quirks:
 
-* Wi-Fi (using `brcmfmac`)
+* Audio
 * Bluetooth (using `hci_bcm`)
+* Wi-Fi (using `brcmfmac`)
 
 Partially functional:
 
-* Display (using `tegradrm`): Instability detected under high load.
+* Display (using `tegradrm`): Minor instability found under high load.
 * GPU (using `nouveau`): Works enough to render kmscube.
 
 Non-functional:
@@ -44,7 +45,7 @@ Elements not listed above are either not tested/worked on yet, or not
 applicable to this device.
 
 Custom Drivers
------------
+--------------
 
 Drivers that are unique to this kernel port and not mainlined:
 
@@ -53,27 +54,48 @@ Drivers that are unique to this kernel port and not mainlined:
   See `drivers/power/supply/lc709203f-fuel-gauge.c`
 
 Quirks
------------
+------
 
-* Bootloader: Baking too many modules into the kernel itself will cause kernel
-  panics and initramfs failures on boot. Reason unknown.
+Minor:
+
+* Audio: Userspace needs custom ALSA UCM and Wireplumber configuration to work
+  properly with the tablet's audio hardware. You can find it at :
+  https://github.com/JordanViknar/linux-tn8-rootfs
 * Wi-Fi & Bluetooth: Requires firmware files inside initramfs. Requires booting
   downstream kernel first, then directly restarting into mainline.
 * GPU: Requires firmware files inside initramfs.
 
-Implementation Notes
------------
+Major:
 
+* Bootloader: Baking too many modules into the kernel itself will cause kernel
+  module glitches and initramfs failures on boot. Reason unknown.
+* Display: Do not reboot from mainline into downstream kernel. It glitches the
+  display and may cause hardware damage if left in this state too long.
+  Rebooting from downstream into mainline is unaffected.
+
+Implementation Notes
+--------------------
+
+* Audio: The SHIELD Tablet does not wire up a dedicated headphone-detect GPIO.
+  Instead, the RT5639 uses its built-in jack detection (`realtek,jack-detect-source`),
+  requiring a small generic addition to `tegra_asoc_machine.c` to support codecs
+  with `.set_jack()` but no HP detect GPIO.
+  Audio routing (speaker/headphones, microphone selection, etc.) is supposed to
+  be handled entirely in userspace via ALSA UCM + WirePlumber.
+  Because the RT5639 exposes speaker and headphone outputs through a shared PCM,
+  UCM presents them as separate profiles rather than switchable ports.
+  WirePlumber's `auto-profile` rule provides automatic switching.
+  This seems to be an upstream rt5640 UCM limitation also affecting other devices.
+* Memory controller: Couldn't get some of the downstream kernel's values to
+  work on mainline. Using the values from Aaron Kling's `tegra124-ardbeg-emc.dtsi`
+  seems to be stable.
+  See `arch/arm/boot/dts/nvidia/tegra124-tn8-emc.dtsi`.
 * SMP: On the Android L bootloader (may not be exclusive to it), PSCI CPU_ON
   claims success but never actually powers on CPU1-3. Worked around by using
   a PSCI CPU_ON call on CPU0 (already running) purely to register the reset
   vector with firmware, then powering CPU1-3 on directly via PMC instead of
   PSCI, matching what the Tegra4Linux kernel does.
   See `arch/arm/mach-tegra/reset.c` and `arch/arm/mach-tegra/platsmp.c`.
-* Memory controller: Couldn't get some of the downstream kernel's values to
-  work on mainline. Using the values from Aaron Kling's `tegra124-ardbeg-emc.dtsi`
-  seems to be stable.
-  See `arch/arm/boot/dts/nvidia/tegra124-tn8-emc.dtsi`.
 
 Credits
 -----------
@@ -83,10 +105,8 @@ Previous mainline ports:
 * Alexandre Courbot, for his original basic Linux 3.17 mainline port, conveniently 
   saved from deletion by Andrew Querol:
   https://github.com/winsock/linux/tree/st8
-* Aaron Kling, for his more recent DTS for the NVIDIA SHIELD Tablet:
+* Aaron Kling, for his more recent partial DTS for the NVIDIA SHIELD Tablet:
   https://gitlab.incom.co/CM-Shield/android_hardware_nvidia_t124_lineage/-/blob/lineage-24.0/tegra124-tn8.dts
-  (Warning : Seemed to be partially incorrect. Did allow me to get the display
-  working without simple-framebuffer though, on top of being used as base.)
 
 Other mainline ports:
 

@@ -166,7 +166,39 @@ int tegra_asoc_machine_init(struct snd_soc_pcm_runtime *rtd)
 					     &tegra_machine_hp_jack_gpio);
 		if (err)
 			dev_err(rtd->dev, "HP GPIOs not added: %d\n", err);
-	}
+	} else if (machine->asoc->add_hp_jack) {
+		/*
+		 * No HP detect GPIO. Some codecs can detect jack insertion
+		 * themselves via their .set_jack() callback.
+		 */
+		struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+
+		/* Skip codecs that don't support jack reporting. */
+		if (codec_dai->component->driver->set_jack) {
+
+			/* Use the board-provided name if available. */
+			jack_name = machine->asoc->hp_jack_name ?: "Headphones Jack";
+
+			/* Create the ALSA jack object. */
+			err = snd_soc_card_jack_new_pins(card, jack_name,
+							 SND_JACK_HEADPHONE,
+							 &tegra_machine_hp_jack,
+							 tegra_machine_hp_jack_pins,
+							 ARRAY_SIZE(tegra_machine_hp_jack_pins));
+			if (err) {
+				dev_err(rtd->dev,
+					"Headphones Jack creation failed: %d\n", err);
+				return err;
+			}
+
+			/* Let the codec report jack state changes. */
+			err = snd_soc_component_set_jack(codec_dai->component,
+							 &tegra_machine_hp_jack, NULL);
+			if (err)
+				dev_dbg(rtd->dev,
+					"codec jack detect not supported: %d\n", err);
+		}
+ 	}
 
 	if (machine->gpiod_hp_det && machine->asoc->add_headset_jack) {
 		err = snd_soc_card_jack_new_pins(card, "Headset Jack",
