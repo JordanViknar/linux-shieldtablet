@@ -32,7 +32,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "panic=5 loglevel=7 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rootfstype=ext4 rw rootwait rootflags=defaults,noatime,nodiratime rootsubdir=/media/0/Linux/ubuntu";
+		bootargs = "panic=5 loglevel=7 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/archlinux.img loopflags=compress=zstd:3,commit=120,discard=async,noatime,nodiratime";
 		/* NVIDIA moment. God why is the SHIELD bootloader like this ??? */
 		linux,initrd-start = <0x81680000>;
 		linux,initrd-end = <0x82800000>;

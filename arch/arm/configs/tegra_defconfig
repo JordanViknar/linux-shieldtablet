@@ -1,3 +1,5 @@
+# Note : Run `make olddefconfig` after using this.
+
 CONFIG_SYSVIPC=y
 CONFIG_NO_HZ_IDLE=y
 CONFIG_HIGH_RES_TIMERS=y
@@ -82,7 +84,6 @@ CONFIG_TEGRA_GMI=y
 CONFIG_TRUSTED_FOUNDATIONS=y
 # CONFIG_MTD is not set
 # CONFIG_MTD_SPI_NOR is not set
-# CONFIG_BLK_DEV_LOOP is not set
 # CONFIG_AD525X_DPOT is not set
 # CONFIG_AD525X_DPOT_I2C is not set
 # CONFIG_ICS932S401 is not set
@@ -270,9 +271,6 @@ CONFIG_IIO=y
 CONFIG_PWM=y
 CONFIG_PWM_TEGRA=y
 CONFIG_PHY_TEGRA_XUSB=y
-CONFIG_EXT4_FS=y
-CONFIG_EXT4_FS_POSIX_ACL=y
-CONFIG_EXT4_FS_SECURITY=y
 # CONFIG_DNOTIFY is not set
 # CONFIG_VFAT_FS is not set
 CONFIG_TMPFS=y
@@ -333,7 +331,6 @@ CONFIG_CRYPTO_LZO=y
 CONFIG_CRYPTO_ZSTD=y
 
 CONFIG_OABI_COMPAT=n
-
 
 # Stuff for Bluetooth mouse
 CONFIG_HID=y
@@ -402,7 +399,7 @@ CONFIG_REGULATOR_FIXED_VOLTAGE=y
 # Multiprocessor
 CONFIG_ARM_PSCI=y
 
-# GPU
+# GPU (disable if you'd rather use the framebuffer)
 CONFIG_DRM_NOUVEAU=y
 CONFIG_NOUVEAU_PLATFORM_DRIVER=y
 # Nouveau asks for these
@@ -425,6 +422,19 @@ CONFIG_DEBUG_FS=y
 # Branding is fun
 CONFIG_LOGO=y
 CONFIG_LOCALVERSION="-tn8"
+
+# Filesystems
+CONFIG_FS_POSIX_ACL=y
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_FS_POSIX_ACL=y
+CONFIG_EXT4_FS_SECURITY=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BTRFS_FS=y
+CONFIG_BTRFS_FS_POSIX_ACL=y
+
+# Used by pacman
+CONFIG_SECURITY_LANDLOCK=y
+CONFIG_LSM="landlock,lockdown,yama,integrity,bpf"
 
 # --- SIZE REDUCTION ---
 # TN8's bootloader will self-destruct the kernel if it's too big.

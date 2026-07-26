@@ -6,6 +6,9 @@ NVIDIA SHIELD Android 5.0/L bootloader. It *should* work on other models, but
 not necessarily other bootloader versions. Use this kernel at your own risk,
 as it is in a very experimental state.
 
+Android M/N bootloader compatibility is not planned short term due to seemingly
+stricter requirements (no initramfs, smaller kernel image size).
+
 In other words, when using this kernel, you agree to the possibility of hardware
 damage. I've had none so far, but cannot guarantee you won't.
 
@@ -35,7 +38,9 @@ Fully functional, with quirks:
 Partially functional:
 
 * Display (using `tegradrm`): Minor instability found under high load.
-* GPU (using `nouveau`): Works enough to render kmscube.
+* GPU (using `nouveau`): Pretty unstable, works only with a patch to Mesa :
+  https://github.com/JordanViknar/mesa-tegra/tree/tegra-fixes
+  If you want to use the framebuffer, disable Nouveau in the kernel config.
 
 Non-functional:
 
