@@ -334,7 +334,6 @@
 
 				ti,channel0-current-microamp = <5>;
 				ti,channel3-current-microamp = <400>;
-				ti,enable-channel3-dual-current;
 				ti,enable-extended-delay;
 
 				#io-channel-cells = <1>;
@@ -702,8 +701,21 @@
 	 * booted. Actual CPU1-3 bring-up happens directly via PMC instead.
 	 */
 	cpus {
-		cpu@0 {
+		cpu0: cpu@0 {
 			vdd-cpu-supply = <&vdd_cpu>;
+			#cooling-cells = <2>;
+		};
+
+		cpu1: cpu@1 {
+			#cooling-cells = <2>;
+		};
+
+		cpu2: cpu@2 {
+			#cooling-cells = <2>;
+		};
+
+		cpu3: cpu@3 {
+			#cooling-cells = <2>;
 		};
 	};
 
@@ -857,5 +869,103 @@
 
 		assigned-clocks = <&tegra_car TEGRA124_CLK_EXTERN1>, <&tegra_pmc TEGRA_PMC_CLK_OUT_1>;
 		assigned-clock-parents = <&tegra_car TEGRA124_CLK_PLL_A_OUT0>, <&tegra_car TEGRA124_CLK_EXTERN1>;
+	};
+
+	// ---------------------------------- THERMAL ----------------------------------
+
+	/*
+	 * Downstream has Tdiode (which we can't implement) and Battery... which gets
+	 * replaced by the fuel gauge's sensor in the final DTS.
+	 */
+
+	/* Note : downstream uses this one *essentially* as the skin sensor I believe... */
+	tboard_thermistor: thermal-sensor-board {
+		compatible = "generic-adc-thermal"; // CONFIG_GENERIC_ADC_THERMAL
+		#thermal-sensor-cells = <0>;
+
+		io-channels = <&palmas_gpadc 1>;
+		io-channel-names = "sensor-channel";
+
+		temperature-lookup-table = <
+			 (-40000)  2578   (-39000)  2577   (-38000)  2576   (-37000)  2575
+			 (-36000)  2574   (-35000)  2573   (-34000)  2572   (-33000)  2571
+			 (-32000)  2569   (-31000)  2568   (-30000)  2567   (-29000)  2565
+			 (-28000)  2563   (-27000)  2561   (-26000)  2559   (-25000)  2557
+			 (-24000)  2555   (-23000)  2553   (-22000)  2550   (-21000)  2548
+			 (-20000)  2545   (-19000)  2542   (-18000)  2539   (-17000)  2536
+			 (-16000)  2532   (-15000)  2529   (-14000)  2525   (-13000)  2521
+			 (-12000)  2517   (-11000)  2512   (-10000)  2507    (-9000)  2502
+			  (-8000)  2497    (-7000)  2492    (-6000)  2486    (-5000)  2480
+			  (-4000)  2473    (-3000)  2467    (-2000)  2460    (-1000)  2452
+			        0  2445       1000  2437       2000  2428       3000  2419
+			     4000  2410       5000  2401       6000  2391       7000  2380
+			     8000  2369       9000  2358      10000  2346      11000  2334
+			    12000  2322      13000  2308      14000  2295      15000  2281
+			    16000  2266      17000  2251      18000  2236      19000  2219
+			    20000  2203      21000  2186      22000  2168      23000  2150
+			    24000  2131      25000  2112      26000  2092      27000  2072
+			    28000  2052      29000  2030      30000  2009      31000  1987
+			    32000  1964      33000  1941      34000  1918      35000  1894
+			    36000  1870      37000  1845      38000  1820      39000  1795
+			    40000  1769      41000  1743      42000  1717      43000  1691
+			    44000  1664      45000  1637      46000  1610      47000  1583
+			    48000  1555      49000  1528      50000  1500      51000  1472
+			    52000  1445      53000  1417      54000  1390      55000  1362
+			    56000  1334      57000  1307      58000  1280      59000  1253
+			    60000  1226      61000  1199      62000  1172      63000  1146
+			    64000  1120      65000  1094      66000  1069      67000  1044
+			    68000  1019      69000   994      70000   970      71000   946
+			    72000   922      73000   899      74000   877      75000   854
+			    76000   832      77000   811      78000   789      79000   769
+			    80000   748      81000   729      82000   709      83000   690
+			    84000   671      85000   653      86000   635      87000   618
+			    88000   601      89000   584      90000   568      91000   552
+			    92000   537      93000   522      94000   507      95000   493
+			    96000   479      97000   465      98000   452      99000   439
+			   100000   427     101000   415     102000   403     103000   391
+			   104000   380     105000   369     106000   359     107000   349
+			   108000   339     109000   329     110000   320     111000   310
+			   112000   302     113000   293     114000   285     115000   277
+			   116000   269     117000   261     118000   254     119000   247
+			   120000   240     121000   233     122000   226     123000   220
+			   124000   214     125000   208
+		>;
+	};
+
+	/* Thus, I copied the mocha's values. */
+	thermal-zones {
+		board-thermal {
+			polling-delay-passive = <1000>; /* milliseconds */
+			polling-delay = <10000>; /* milliseconds */
+
+			thermal-sensors = <&tboard_thermistor>;
+
+			trips {
+				board_alert_trip: board-alert {
+					/* throttle at 50C until temperature drops to 49.5C */
+					temperature = <50000>; // downstream uses 40000
+					hysteresis = <500>; // and 1000
+					type = "passive";
+				};
+
+				/* Downstream doesn't have this one, but no reason not to include it */
+				board-crit {
+					/* shut down at 85C */
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-board {
+					trip = <&board_alert_trip>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
 	};
 };
