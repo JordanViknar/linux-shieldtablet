@@ -4,7 +4,7 @@ Mainline Linux for the NVIDIA SHIELD Tablet (TN8)
 This kernel is being tested exclusively on an NVIDIA SHIELD Tablet K1 with the
 NVIDIA SHIELD Android 5.0/L bootloader. It *should* work on other models, but
 not necessarily other bootloader versions. Use this kernel at your own risk,
-as it is in a very experimental state.
+as it is in a fairly experimental state.
 
 Android M/N bootloader compatibility is not planned short term due to seemingly
 stricter requirements (no initramfs, smaller kernel image size).
@@ -28,23 +28,39 @@ Fully functional:
 * Charger (using `bq24193`)
 * Power monitor (using `ina3221`)
 * Memory controller
+* Thermal sensors (using `tegra_soctherm` and `generic_adc_thermal`)
 
 Fully functional, with quirks:
 
-* Audio
+* Audio (RT5639 codec)
 * Bluetooth (using `hci_bcm`)
 * Wi-Fi (using `brcmfmac`)
 
 Partially functional:
 
-* Display (using `tegradrm`): Minor instability found under high load.
+* Display (using `tegradrm`): Instability found under high system load.
 * GPU (using `nouveau`): Pretty unstable, works only with a patch to Mesa :
   https://github.com/JordanViknar/mesa-tegra/tree/tegra-fixes
   If you want to use the framebuffer, disable Nouveau in the kernel config.
 
-Non-functional:
+Configured, untested :
 
+* Accelerometer + gyroscope (using `inv-mpu6050-i2c`)
+* Magnetometer (using `ak8975`)
+* Thermal zones
+
+Non-functional / not worked on yet:
+
+* SD card reader
+* USB device and host
 * Touchscreen: No driver in mainline.
+* GPS
+* Camera
+
+Unplanned (excluding external contributions) :
+
+* 3G/LTE: My SHIELD Tablet is a K1, it only has Wi-Fi.
+* Stylus: I do not have the stylus, so I cannot test it.
 
 Elements not listed above are either not tested/worked on yet, or not
 applicable to this device.

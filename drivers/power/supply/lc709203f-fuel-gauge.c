@@ -294,7 +294,7 @@ static int lc709203f_hw_init(struct lc709203f_chip *chip)
 }
 
 static const struct power_supply_desc lc709203f_psy_desc = {
-	.name = "lc709203f-fuel-gauge",
+	.name = "lc709203f-gauge",
 	.type = POWER_SUPPLY_TYPE_BATTERY,
 	.get_property = lc709203f_get_property,
 	/* .properties and .num_properties are set in probe(), based on optional features */
