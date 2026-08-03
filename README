@@ -6,11 +6,11 @@ NVIDIA SHIELD Android 5.0/L bootloader. It *should* work on other models, but
 not necessarily other bootloader versions. Use this kernel at your own risk,
 as it is in a fairly experimental state.
 
-Android M/N bootloader compatibility is not planned short term due to seemingly
-stricter requirements (no initramfs, smaller kernel image size).
-
 In other words, when using this kernel, you agree to the possibility of hardware
 damage. I've had none so far, but cannot guarantee you won't.
+
+Android M/N bootloader compatibility is not planned short term due to seemingly
+stricter requirements (no initramfs, smaller kernel image size).
 
 This port uses `tegra_defconfig` to store its default kernel configuration.
 
@@ -42,6 +42,7 @@ Partially functional:
 * GPU (using `nouveau`): Pretty unstable, works only with a patch to Mesa :
   https://github.com/JordanViknar/mesa-tegra/tree/tegra-fixes
   If you want to use the framebuffer, disable Nouveau in the kernel config.
+  Xorg seems to have major issues, Wayland works a bit better.
 
 Configured, untested :
 
@@ -54,6 +55,7 @@ Non-functional / not worked on yet:
 * SD card reader
 * USB device and host
 * Touchscreen: No driver in mainline.
+* HDMI
 * GPS
 * Camera
 

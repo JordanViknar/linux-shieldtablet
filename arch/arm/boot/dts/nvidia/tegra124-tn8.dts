@@ -32,7 +32,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "panic=5 loglevel=7 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/archlinux.img loopflags=compress=zstd:3,commit=120,discard=async,noatime,nodiratime";
+		bootargs = "panic=5 loglevel=7 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:3,commit=120,discard=async,noatime,nodiratime";
 		/* NVIDIA moment. God why is the SHIELD bootloader like this ??? */
 		linux,initrd-start = <0x81680000>;
 		linux,initrd-end = <0x82800000>;
@@ -407,6 +407,7 @@
 
 			pmic {
 				compatible = "ti,tps65913-pmic", "ti,palmas-pmic"; // CONFIG_REGULATOR_PALMAS
+
 				ldo1-in-supply = <&palmas_smps6_reg>;
 				ldo5-in-supply = <&palmas_smps8_reg>;
 				ldo9-in-supply = <&palmas_smps9_reg>;
@@ -612,17 +613,6 @@
 		};
 	};
 
-	brcm_wifi_pwrseq: pwrseq-wifi {
-		compatible = "mmc-pwrseq-simple"; // CONFIG_PWRSEQ_SIMPLE
-
-		clocks = <&tegra_pmc TEGRA_PMC_CLK_BLINK>;
-		clock-names = "ext_clock";
-
-		reset-gpios = <&gpio TEGRA_GPIO(X, 7) GPIO_ACTIVE_LOW>;
-		post-power-on-delay-ms = <300>;
-		power-off-delay-us = <300>;
-	};
-
 	/* Wi-Fi */
 	sdmmc1: mmc@700b0000 {
 		status = "okay";
@@ -721,7 +711,16 @@
 
 	extcon-keys {
 		compatible = "gpio-keys"; // CONFIG_KEYBOARD_GPIO
-		
+
+		/* Note : Can't be tested on SHIELD Tablet K1. */
+		sw-tablet-mode {
+			label = "Tablet Mode";
+			gpios = <&gpio TEGRA_GPIO(W, 3) GPIO_ACTIVE_LOW>;
+			linux,code = <SW_TABLET_MODE>;
+			linux,input-type = <EV_SW>;
+			wakeup-source;
+		};
+
 		sw-lid {
 			label = "Lid Switch";
 			gpios = <&gpio TEGRA_GPIO(R, 4) GPIO_ACTIVE_LOW>;
@@ -761,6 +760,19 @@
 	hda@70030000 {
 		status = "okay";
 	};
+
+	brcm_wifi_pwrseq: pwrseq-wifi {
+		compatible = "mmc-pwrseq-simple"; // CONFIG_PWRSEQ_SIMPLE
+
+		clocks = <&tegra_pmc TEGRA_PMC_CLK_BLINK>;
+		clock-names = "ext_clock";
+
+		reset-gpios = <&gpio TEGRA_GPIO(X, 7) GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <300>;
+		power-off-delay-us = <300>;
+	};
+
+	// ---------------------------------- REGULATORS ----------------------------------
 
 	vdd_ac_bat_reg: regulator-acbat {
 		compatible = "regulator-fixed"; // CONFIG_REGULATOR_FIXED_VOLTAGE
