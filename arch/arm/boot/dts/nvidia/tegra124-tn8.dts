@@ -712,7 +712,10 @@
 	extcon-keys {
 		compatible = "gpio-keys"; // CONFIG_KEYBOARD_GPIO
 
-		/* Note : Can't be tested on SHIELD Tablet K1. */
+		/*
+		 * Note : Can't be tested on SHIELD Tablet K1.
+		 * It's linked to stylus pen detection.
+		 */
 		sw-tablet-mode {
 			label = "Tablet Mode";
 			gpios = <&gpio TEGRA_GPIO(W, 3) GPIO_ACTIVE_LOW>;

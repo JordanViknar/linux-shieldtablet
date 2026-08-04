@@ -4,15 +4,16 @@ Mainline Linux for the NVIDIA SHIELD Tablet (TN8)
 This kernel is being tested exclusively on an NVIDIA SHIELD Tablet K1 with the
 NVIDIA SHIELD Android 5.0/L bootloader. It *should* work on other models, but
 not necessarily other bootloader versions. Use this kernel at your own risk,
-as it is in a fairly experimental state.
+as it is still in a fairly experimental state.
 
 In other words, when using this kernel, you agree to the possibility of hardware
 damage. I've had none so far, but cannot guarantee you won't.
 
-Android M/N bootloader compatibility is not planned short term due to seemingly
-stricter requirements (no initramfs, smaller kernel image size).
+Android M/N bootloader compatibility is not immediately planned due to
+seemingly stricter requirements (no initramfs unless bundled in-kernel, smaller
+kernel image size).
 
-This port uses `tegra_defconfig` to store its default kernel configuration.
+This port uses `tn8_defconfig` to store its default kernel configuration.
 
 Note: Compile with `-march=armv7ve -mtune=cortex-a15`.
 
@@ -27,7 +28,6 @@ Fully functional:
 * Fuel gauge (using custom driver `lc709203f`)
 * Charger (using `bq24193`)
 * Power monitor (using `ina3221`)
-* Memory controller
 * Thermal sensors (using `tegra_soctherm` and `generic_adc_thermal`)
 
 Fully functional, with quirks:
@@ -39,10 +39,14 @@ Fully functional, with quirks:
 Partially functional:
 
 * Display (using `tegradrm`): Instability found under high system load.
+* Memory controller: Values potentially slightly off compared to downstream,
+  might be the actual reason for display instability.
 * GPU (using `nouveau`): Pretty unstable, works only with a patch to Mesa :
   https://github.com/JordanViknar/mesa-tegra/tree/tegra-fixes
-  If you want to use the framebuffer, disable Nouveau in the kernel config.
   Xorg seems to have major issues, Wayland works a bit better.
+  Personally, I have `MESA_LOADER_DRIVER_OVERRIDE=tegra` in `/etc/environment`
+  and then enable software renderer for applications that are too buggy.
+  (Example: `GSK_RENDERER=cairo` for GTK apps)
 
 Configured, untested :
 
@@ -82,19 +86,22 @@ Quirks
 Minor:
 
 * Audio: Userspace needs custom ALSA UCM and Wireplumber configuration to work
-  properly with the tablet's audio hardware. You can find it at :
+  properly with the tablet's audio hardware. See:
   https://github.com/JordanViknar/linux-tn8-rootfs
-* Wi-Fi & Bluetooth: Requires firmware files inside initramfs. Requires booting
-  downstream kernel first, then directly restarting into mainline.
-* GPU: Requires firmware files inside initramfs.
+* Wi-Fi & Bluetooth: Requires firmware files inside initramfs. See:
+  https://github.com/JordanViknar/linux-tn8-firmware
+  Requires booting downstream kernel first, then directly restarting into
+  mainline through fastboot.
+* GPU: Requires firmware files inside initramfs. See:
+  https://github.com/JordanViknar/linux-tn8-firmware
 
 Major:
 
 * Bootloader: Baking too many modules into the kernel itself will cause kernel
-  module glitches and initramfs failures on boot. Reason unknown.
-* Display: Do not reboot from mainline into downstream kernel. It glitches the
-  display and may cause hardware damage if left in this state too long.
-  Rebooting from downstream into mainline is unaffected.
+  and/or initramfs failures on boot. Reason unknown.
+* Display: Do not reboot directly from mainline into downstream kernel. It
+  glitches the display and may cause hardware damage if left in this state too
+  long. Rebooting from downstream into mainline is unaffected.
 
 Implementation Notes
 --------------------
@@ -111,7 +118,7 @@ Implementation Notes
   This seems to be an upstream rt5640 UCM limitation also affecting other devices.
 * Memory controller: Couldn't get some of the downstream kernel's values to
   work on mainline. Using the values from Aaron Kling's `tegra124-ardbeg-emc.dtsi`
-  seems to be stable.
+  seems to be stable enough for booting and running the system.
   See `arch/arm/boot/dts/nvidia/tegra124-tn8-emc.dtsi`.
 * SMP: On the Android L bootloader (may not be exclusive to it), PSCI CPU_ON
   claims success but never actually powers on CPU1-3. Worked around by using
@@ -128,14 +135,18 @@ Previous mainline ports:
 * Alexandre Courbot, for his original basic Linux 3.17 mainline port, conveniently 
   saved from deletion by Andrew Querol:
   https://github.com/winsock/linux/tree/st8
-* Aaron Kling, for his more recent partial DTS for the NVIDIA SHIELD Tablet:
+* Aaron Kling, for his more recent partial device trees for the NVIDIA SHIELD Tablet:
   https://gitlab.incom.co/CM-Shield/android_hardware_nvidia_t124_lineage/-/blob/lineage-24.0/tegra124-tn8.dts
+  and Ardberg:
+  https://gitlab.incom.co/CM-Shield/android_hardware_nvidia_t124_lineage/-/blob/lineage-24.0/tegra124-ardbeg.dts
 
 Other mainline ports:
 
-* tegra124-xiaomi-mocha.dts: Similar device used for some comparisons and
+* `tegra124-xiaomi-mocha.dts`: Similar-ish device used for some comparisons and
   general structure.
-* tegra114-roth.dts & tegra114-tn7.dts: NVIDIA devices with similar bootloaders.
+* `tegra30-asus-nexus7-grouper-common.dtsi`: Helped me with audio support.
+* `tegra234-p3737-0000+p3701.dtsi` and `tegra234-p3740-0002+p3701-0008.dts`:
+  Helped me tremendously with headphones support.
 
 Downstream kernel:
 
