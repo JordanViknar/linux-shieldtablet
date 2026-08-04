@@ -11,7 +11,7 @@ damage. I've had none so far, but cannot guarantee you won't.
 
 Android M/N bootloader compatibility is not immediately planned due to
 seemingly stricter requirements (no initramfs unless bundled in-kernel, smaller
-kernel image size).
+kernel image size). The structure to support it is in place though.
 
 This port uses `tn8_defconfig` to store its default kernel configuration.
 
@@ -47,6 +47,7 @@ Partially functional:
   Personally, I have `MESA_LOADER_DRIVER_OVERRIDE=tegra` in `/etc/environment`
   and then enable software renderer for applications that are too buggy.
   (Example: `GSK_RENDERER=cairo` for GTK apps)
+* Backlight: Can be turned on and off, but no further control.
 
 Configured, untested :
 

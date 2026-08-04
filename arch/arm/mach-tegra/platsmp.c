@@ -203,7 +203,7 @@ const struct smp_operations tegra_smp_ops __initconst = {
  */
 bool __init tegra_smp_init(void)
 {
-	if (!of_machine_is_compatible("nvidia,tn8"))
+	if (!of_machine_is_compatible("nvidia,tn8-l"))
 		return false;
 
 	smp_set_ops(&tegra_smp_ops);

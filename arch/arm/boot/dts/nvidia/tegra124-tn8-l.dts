@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+
+/* tegra124-tn8 */
+#include "tegra124-tn8.dtsi"
+
+/*
+ * This file can be essentially summarized as "Damn it NVIDIA !"
+ */
+
+/ {
+	model = "NVIDIA SHIELD Tablet (Android 5.0/L)";
+	// "nvidia,tn8" goes first to keep the same Wi-Fi/Bluetooth firmware blob naming.
+	compatible = "nvidia,tn8", "nvidia,tn8-l", "nvidia,tegra124";
+
+	// --- Initramfs ---
+
+	/* At least this bootloader allows an initramfs but... damn it NVIDIA ! */
+	chosen {
+		linux,initrd-start = <0x81680000>;
+		linux,initrd-end = <0x82800000>;
+	};
+
+	// --- Memory ---
+
+	/* Another NVIDIA moment */
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		bootloader_fb: bootloader-framebuffer@ad012000 {
+			reg = <0x0 0xad012000 0x0 0x011e0000>;
+			no-map;
+		};
+
+		framebuffer: framebuffer@f7c00000 {
+			reg = <0x0 0xf7c00000 0x0 0x01200000>;
+			no-map;
+		};
+
+		framebuffer2: framebuffer2@f8e00000 {
+			reg = <0x0 0xf8e00000 0x0 0x04800000>;
+			no-map;
+		};
+
+		nck: nck@fd700000 {
+			reg = <0x0 0xfd700000 0x0 0x00100000>;
+			no-map;
+		};
+
+		/*
+		 * I was unable to remove this area without causing a crash,
+		 * despite it not getting mentioned by the downstream kernel.
+		 */
+		would_be_freed_fd800000: would-be-freed@fd800000 {
+			reg = <0x0 0xfd800000 0x0 0x007f0000>;
+			no-map;
+		};
+
+		lp0: lp0@fdfff000 {
+			reg = <0x0 0xfdfff000 0x0 0x00000820>;
+			no-map;
+		};
+
+		tsec: tsec@fe000000 {
+			reg = <0x0 0xfe000000 0x0 0x02000000>;
+			no-map;
+		};
+	};
+
+	// --- CPU ---
+
+	psci {
+		compatible = "arm,psci";
+		method = "smc";
+		cpu_suspend = <0x84000001>;
+		cpu_on = <0x84000003>;
+	};
+
+	/*
+	 * A `psci` node is present in this file even though PSCI is NOT used to
+	 * power on CPU1-3 - on this board's (Android L) bootloader, PSCI CPU_ON
+	 * claims success but never actually powers them on. Do not remove the
+	 * psci node thinking it's unused: the kernel still needs it for one
+	 * thing - registering its reset vector with firmware, via a CPU_ON call
+	 * targeting CPU0 (already running) rather than the CPUs actually being
+	 * booted. Actual CPU1-3 bring-up happens directly via PMC instead.
+	 */
+	cpus {
+		cpu0: cpu@0 {
+			vdd-cpu-supply = <&vdd_cpu>;
+			#cooling-cells = <2>;
+		};
+
+		cpu1: cpu@1 {
+			#cooling-cells = <2>;
+		};
+
+		cpu2: cpu@2 {
+			#cooling-cells = <2>;
+		};
+
+		cpu3: cpu@3 {
+			#cooling-cells = <2>;
+		};
+	};
+};

@@ -32,58 +32,11 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "panic=5 loglevel=7 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:3,commit=120,discard=async,noatime,nodiratime";
-		/* NVIDIA moment. God why is the SHIELD bootloader like this ??? */
-		linux,initrd-start = <0x81680000>;
-		linux,initrd-end = <0x82800000>;
+		bootargs = "panic=15 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:3,commit=120,discard=async,noatime,nodiratime";
 	};
 
 	memory@80000000 {
 		reg = <0x0 0x80000000 0x0 0x80000000>;
-	};
-
-	/* Another NVIDIA SHIELD bootloader moment */
-	reserved-memory {
-		#address-cells = <2>;
-		#size-cells = <2>;
-		ranges;
-
-		bootloader_fb: bootloader-framebuffer@ad012000 {
-			reg = <0x0 0xad012000 0x0 0x011e0000>;
-			no-map;
-		};
-
-		framebuffer: framebuffer@f7c00000 {
-			reg = <0x0 0xf7c00000 0x0 0x01200000>;
-			no-map;
-		};
-
-		framebuffer2: framebuffer2@f8e00000 {
-			reg = <0x0 0xf8e00000 0x0 0x04800000>;
-			no-map;
-		};
-
-		nck: nck@fd700000 {
-			reg = <0x0 0xfd700000 0x0 0x00100000>;
-			no-map;
-		};
-
-		/* Downstream doesn't mention this area in its dmesg, but I was unable to remove it without causing a crash. */
-		/* Oh well, it's 8.32 MB */
-		would_be_freed_fd800000: would-be-freed@fd800000 {
-			reg = <0x0 0xfd800000 0x0 0x007f0000>;
-			no-map;
-		};
-
-		lp0: lp0@fdfff000 {
-			reg = <0x0 0xfdfff000 0x0 0x00000820>;
-			no-map;
-		};
-
-		tsec: tsec@fe000000 {
-			reg = <0x0 0xfe000000 0x0 0x02000000>;
-			no-map;
-		};
 	};
 
 	backlight: backlight {
@@ -674,41 +627,6 @@
 		clock-output-names = "ref-oscillator";
 	};
 
-	psci {
-		compatible = "arm,psci";
-		method = "smc";
-		cpu_suspend = <0x84000001>;
-		cpu_on = <0x84000003>;
-	};
-
-	/*
-	 * A `psci` node is present in this file even though PSCI is NOT used to
-	 * power on CPU1-3 - on this board's (Android L) bootloader, PSCI CPU_ON
-	 * claims success but never actually powers them on. Do not remove the
-	 * psci node thinking it's unused: the kernel still needs it for one
-	 * thing - registering its reset vector with firmware, via a CPU_ON call
-	 * targeting CPU0 (already running) rather than the CPUs actually being
-	 * booted. Actual CPU1-3 bring-up happens directly via PMC instead.
-	 */
-	cpus {
-		cpu0: cpu@0 {
-			vdd-cpu-supply = <&vdd_cpu>;
-			#cooling-cells = <2>;
-		};
-
-		cpu1: cpu@1 {
-			#cooling-cells = <2>;
-		};
-
-		cpu2: cpu@2 {
-			#cooling-cells = <2>;
-		};
-
-		cpu3: cpu@3 {
-			#cooling-cells = <2>;
-		};
-	};
-
 	extcon-keys {
 		compatible = "gpio-keys"; // CONFIG_KEYBOARD_GPIO
 
@@ -775,7 +693,7 @@
 		power-off-delay-us = <300>;
 	};
 
-	// ---------------------------------- REGULATORS ----------------------------------
+	// --- Regulators ---
 
 	vdd_ac_bat_reg: regulator-acbat {
 		compatible = "regulator-fixed"; // CONFIG_REGULATOR_FIXED_VOLTAGE
@@ -886,14 +804,14 @@
 		assigned-clock-parents = <&tegra_car TEGRA124_CLK_PLL_A_OUT0>, <&tegra_car TEGRA124_CLK_EXTERN1>;
 	};
 
-	// ---------------------------------- THERMAL ----------------------------------
+	// --- Thermal ---
 
 	/*
-	 * Downstream has Tdiode (which we can't implement) and Battery... which gets
-	 * replaced by the fuel gauge's sensor in the final DTS.
+	 * Downstream has Tdiode (which we can't implement) and mentions Battery... but
+	 * actually disables it and goes with the fuel gauge's thermistor instead.
 	 */
 
-	/* Note : downstream uses this one *essentially* as the skin sensor I believe... */
+	/* Note : Downstream uses this one *essentially* as the skin sensor I believe... */
 	tboard_thermistor: thermal-sensor-board {
 		compatible = "generic-adc-thermal"; // CONFIG_GENERIC_ADC_THERMAL
 		#thermal-sensor-cells = <0>;
