@@ -75,6 +75,7 @@
 		compatible = "arm,psci";
 		method = "smc";
 		cpu_suspend = <0x84000001>;
+		cpu_off = <0x84000002>; // This one isn't mentioned by downstream
 		cpu_on = <0x84000003>;
 	};
 

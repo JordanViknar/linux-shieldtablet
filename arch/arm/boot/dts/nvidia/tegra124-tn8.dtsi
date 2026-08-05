@@ -32,7 +32,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "panic=15 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:3,commit=120,discard=async,noatime,nodiratime";
+		bootargs = "panic=15 fbcon=rotate:3 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:1,commit=120,discard=async,noatime,nodiratime";
 	};
 
 	memory@80000000 {
