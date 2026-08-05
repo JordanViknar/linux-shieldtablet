@@ -35,6 +35,7 @@
 #include <dt-bindings/thermal/tegra124-soctherm.h>
 
 #include "../thermal_core.h"
+#include "../thermal_hwmon.h"
 #include "soctherm.h"
 
 #define SENSOR_CONFIG0				0
@@ -2215,6 +2216,9 @@ static int tegra_soctherm_probe(struct platform_device *pdev)
 
 		zone->tz = z;
 		tegra->thermctl_tzs[soc->ttgs[i]->id] = z;
+
+		/* Add hwmon sysfs entries */
+		devm_thermal_add_hwmon_sysfs(&pdev->dev, z);
 
 		/* Configure hw trip points */
 		err = tegra_soctherm_set_hwtrips(&pdev->dev, soc->ttgs[i], z);
