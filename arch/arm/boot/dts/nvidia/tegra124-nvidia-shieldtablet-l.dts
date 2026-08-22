@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /dts-v1/;
 
-/* tegra124-tn8 */
-#include "tegra124-tn8.dtsi"
+#include "tegra124-nvidia-shieldtablet.dtsi"
 
 /*
  * This file can be essentially summarized as "Damn it NVIDIA !"
@@ -10,8 +9,8 @@
 
 / {
 	model = "NVIDIA SHIELD Tablet (Android 5.0/L)";
-	// "nvidia,tn8" goes first to keep the same Wi-Fi/Bluetooth firmware blob naming.
-	compatible = "nvidia,tn8", "nvidia,tn8-l", "nvidia,tegra124";
+	// "nvidia,shieldtablet" goes first to keep the same Wi-Fi/Bluetooth firmware blob naming.
+	compatible = "nvidia,shieldtablet", "nvidia,shieldtablet-l", "nvidia,tegra124";
 
 	// --- Initramfs ---
 

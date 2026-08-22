@@ -209,9 +209,11 @@ properties:
         items:
           - const: xiaomi,mocha
           - const: nvidia,tegra124
-      - description: NVIDIA SHIELD Tablet (TN8)
+      - description: NVIDIA SHIELD Tablet
         items:
-          - const: nvidia,tn8
+          - enum:
+              - nvidia,shieldtablet-l
+          - const: nvidia,shieldtablet
           - const: nvidia,tegra124
       - items:
           - enum:
