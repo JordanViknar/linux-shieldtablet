@@ -1,0 +1,1723 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * raydium-rm31080-spi-bridge.c
+ *
+ * Mainline swap-in for the downstream NVIDIA/Raydium "rm31080a_ts.c" misc
+ * device driver (drivers/input/touchscreen/rm31080a_ts.c +
+ * rm31080a_ctrl.c in android_kernel_nvidia_shield-lineage-18.1), rewritten
+ * against modern DT/gpiod/regulator/clk/spi APIs.
+ *
+ * This driver is NOT a reimplementation of the Raydium touch algorithm.
+ * All of that logic (register maps, scan tuning, coordinate calculus,
+ * calibration) lives in the closed-source userspace stack (ts.default.so +
+ * librm31080.so, invoked through the "rm-wrapper" shim) that is used
+ * unmodified. This driver exists purely to reproduce, at the kernel/ABI
+ * boundary, the exact protocol that userspace already speaks to the
+ * downstream driver:
+ *
+ *   - a misc device node named "touch" (-> /dev/touch)
+ *   - read()/write() as near-literal single-transaction SPI accesses
+ *   - an ioctl surface (RM_IOCTL_*) for HAL-pid registration, touch-point
+ *     injection, scalar get/set variables, raw scan buffer draining, and
+ *     uploading 16 tables of small opcodes ("KRL" tables) that this driver
+ *     must be able to execute against real hardware (regulators, GPIOs,
+ *     the touch clock, and the SPI bus itself) whenever userspace asks for
+ *     resume/suspend/watchdog/scan-start/etc.
+ *   - realtime-signal (SIGRTMIN+12, i.e. signal 44) delivery to a
+ *     registered HAL pid whenever new scan data is ready
+ *
+ * Every piece of protocol behaviour below was verified against the
+ * downstream kernel source (functions named in comments) and, where
+ * relevant, against a decompilation of the userspace binaries that
+ * actually drive this hardware. Anywhere this port simplifies or
+ * defers downstream behaviour, it is called out explicitly with a
+ * "NOTE:" comment -- search for NOTE: before relying on this driver
+ * for anything beyond basic touch + resume/suspend.
+ *
+ * Devicetree bindings expected on the SPI child node (see the
+ * "raydium,rm31080" node already present in tegra124-shieldtablet.dtsi):
+ *
+ *   compatible      = "raydium,rm31080";
+ *   reg             = <0>;
+ *   spi-max-frequency = <18000000>;
+ *   interrupts (or interrupts-extended) = the IRQ GPIO, IRQ_TYPE_EDGE_RISING
+ *   reset-gpios     = the reset GPIO, GPIO_ACTIVE_LOW
+ *   avdd-supply     = 3.3V analog rail
+ *   dvdd-supply     = 1.8V digital rail
+ *   clocks / clock-names = "extern2" (the touch clock parent chain)
+ *   raydium,platform-id  = <0x0b>   (RM_PLATFORM_T008; REQUIRED, see below)
+ *   raydium,gpio-select  = <0x00>  (optional, defaults to 0)
+ *
+ * raydium,platform-id and raydium,gpio-select are NOT part of the
+ * downstream binding doc (which only documented spidev-style properties);
+ * downstream supplied these two values from board-file C code
+ * (board-ardbeg.c: rm31080ts_tn8_data.platform_id = RM_PLATFORM_T008).
+ * Since we have no board file, they must come from DT instead. Userspace
+ * fetches them via RM_IOCTL_GET_VARIABLE and uses them to pick which
+ * "para_XX_YY_ZZ_WW.so" config blob to dlopen() -- get this wrong and the
+ * HAL silently loads the wrong board's tuning data.
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/mutex.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/pid.h>
+#include <linux/signal.h>
+#include <linux/uaccess.h>
+#include <linux/interrupt.h>
+#include <linux/workqueue.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/poll.h>
+#include <linux/spi/spi.h>
+#include <linux/gpio/consumer.h>
+#include <linux/regulator/consumer.h>
+#include <linux/clk.h>
+#include <linux/of.h>
+#include <linux/input.h>
+#include <linux/input/mt.h>
+#include <linux/pm.h>
+
+#define DRV_NAME "raydium-rm31080-spi-bridge"
+
+/* =========================================================================
+ * Protocol constants
+ * Ported verbatim from include/linux/spi/rm31080a_ts.h and
+ * include/linux/spi/rm31080a_ctrl.h in the downstream tree. These are the
+ * ABI between this driver and the userspace HAL and must not be changed.
+ * ========================================================================= */
+
+#define RM_TS_SIGNAL			44	/* realtime signal used for events */
+
+#define RM_SIGNAL_INTR			0x00000001
+#define RM_SIGNAL_SUSPEND		0x00000002
+#define RM_SIGNAL_RESUME		0x00000003
+#define RM_SIGNAL_CHANGE_PARA		0x00000004
+#define RM_SIGNAL_WATCH_DOG_CHECK	0x00000005
+#define RM_SIGNAL_REPORT_MODE_CHANGE	0x00000006
+
+#define RM_IOCTL_REPORT_POINT		0x1001
+#define RM_IOCTL_SET_HAL_PID		0x1002
+#define RM_IOCTL_INIT_START		0x1003
+#define RM_IOCTL_INIT_END		0x1004
+#define RM_IOCTL_FINISH_CALC		0x1005
+#define RM_IOCTL_SCRIBER_CTRL		0x1006
+#define RM_IOCTL_READ_RAW_DATA		0x1007
+#define RM_IOCTL_SET_PARAMETER		0x100A
+#define RM_IOCTL_SET_VARIABLE		0x1010
+#define RM_IOCTL_GET_VARIABLE		0x1011
+#define RM_IOCTL_GET_SCAN_MODE		0x1012	/* downstream calls it "SACN" */
+#define RM_IOCTL_SET_KRL_TBL		0x1013
+#define RM_IOCTL_WATCH_DOG		0x1014
+#define RM_IOCTL_SET_BASELINE		0x1015
+#define RM_IOCTL_INIT_SERVICE		0x1016
+#define RM_IOCTL_SET_CLK		0x1017
+
+/* RM_IOCTL_SET_VARIABLE / RM_IOCTL_GET_VARIABLE index space (packed into
+ * the upper 16 bits of the ioctl cmd by userspace: (index << 16) | ioctl) */
+#define RM_VARIABLE_SELF_TEST_RESULT	0x01
+#define RM_VARIABLE_SCRIBER_FLAG	0x02
+#define RM_VARIABLE_AUTOSCAN_FLAG	0x03
+#define RM_VARIABLE_VERSION		0x04
+#define RM_VARIABLE_IDLEMODECHECK	0x05
+#define RM_VARIABLE_REPEAT		0x06
+#define RM_VARIABLE_WATCHDOG_FLAG	0x07
+#define RM_VARIABLE_TEST_VERSION	0x08
+#define RM_VARIABLE_SET_SPI_UNLOCK	0x09
+#define RM_VARIABLE_SET_WAKE_UNLOCK	0x0A
+#define RM_VARIABLE_DPW			0x0B
+#define RM_VARIABLE_NS_MODE		0x0C
+#define RM_VARIABLE_TOUCHFILE_STATUS	0x0D
+#define RM_VARIABLE_TOUCH_EVENT		0x0E
+
+/* GET_VARIABLE has its own, differently-numbered index space */
+#define RM_VARIABLE_PLATFORM_ID	0x01
+#define RM_VARIABLE_GPIO_SELECT	0x02
+#define RM_VARIABLE_CHECK_SPI_LOCK	0x03
+
+#define MASK_USER_SPACE_POINTER	0x00000000FFFFFFFFULL
+
+/* KRL ("kernel table") bytecode -- executed by this driver whenever
+ * userspace asks for resume/suspend/watchdog/scan-start/etc. Table content
+ * is uploaded at runtime by userspace (RM_IOCTL_SET_KRL_TBL); we only need
+ * to implement the interpreter, ported from rm_tch_cmd_process() in
+ * rm31080a_ts.c. */
+#define KRL_TBL_FIELD_POS_LEN_H	0
+#define KRL_TBL_FIELD_POS_LEN_L	1
+#define KRL_TBL_FIELD_POS_CASE_NUM	2
+#define KRL_TBL_FIELD_POS_CMD_NUM	3
+#define KRL_TBL_CMD_LEN			3
+#define KRL_TBL_MAX_LEN			0x680	/* 1664 bytes, per-index buffer */
+#define KRL_TBL_COUNT			17	/* indices 0..16 */
+
+#define KRL_CMD_READ			0x11
+#define KRL_CMD_WRITE_W_DATA		0x12
+#define KRL_CMD_WRITE_WO_DATA		0x13
+#define KRL_CMD_IF_AND_OR		0x14
+#define KRL_CMD_AND			0x18
+#define KRL_CMD_OR			0x19
+#define KRL_CMD_NOT			0x1A
+#define KRL_CMD_XOR			0x1B
+#define KRL_CMD_WRITE_W_COUNT		0x1C
+#define KRL_CMD_RETURN_RESULT		0x1D
+#define KRL_CMD_RETURN_VALUE		0x1E
+#define KRL_CMD_DRAM_INIT		0x1F
+#define KRL_CMD_SEND_SIGNAL		0x20
+#define KRL_CMD_CONFIG_RST		0x21
+#define KRL_CMD_SET_TIMER		0x22
+#define KRL_CMD_CONFIG_3V3		0x23
+#define KRL_CMD_CONFIG_1V8		0x24
+#define KRL_CMD_CONFIG_CLK		0x25
+#define KRL_CMD_CONFIG_CS		0x26
+#define KRL_CMD_MSLEEP			0x40
+#define KRL_CMD_FLUSH_QU		0x52
+#define KRL_CMD_READ_IMG		0x60
+#define KRL_CMD_WRITE_IMG		0x61
+#define KRL_CMD_CONFIG_IRQ		0x70
+#define KRL_CMD_DUMMY			0xFF
+
+#define KRL_SUB_CMD_SET_RST_GPIO	0x00
+#define KRL_SUB_CMD_SET_RST_VALUE	0x01
+
+#define KRL_SUB_CMD_SET_3V3_GPIO	0x00
+#define KRL_SUB_CMD_SET_3V3_REGULATOR	0x01
+#define KRL_SUB_CMD_SET_1V8_GPIO	0x00
+#define KRL_SUB_CMD_SET_1V8_REGULATOR	0x01
+
+#define KRL_SUB_CMD_SET_CLK		0x00
+#define KRL_SUB_CMD_SET_CS_LOW		0x00
+#define KRL_SUB_CMD_SET_IRQ		0x00
+
+#define KRL_INDEX_FUNC_SET_IDLE	0
+#define KRL_INDEX_FUNC_PAUSE_AUTO	1
+#define KRL_INDEX_RM_RESUME		2
+#define KRL_INDEX_RM_SUSPEND		3
+#define KRL_INDEX_RM_READ_IMG		4
+#define KRL_INDEX_RM_WATCHDOG		5
+#define KRL_INDEX_RM_TESTMODE		6
+#define KRL_INDEX_RM_SLOWSCAN		7
+#define KRL_INDEX_RM_CLEARINT		8
+#define KRL_INDEX_RM_SCANSTART		9
+#define KRL_INDEX_RM_WAITSCANOK	10
+#define KRL_INDEX_RM_SETREPTIME	11
+#define KRL_INDEX_RM_NSPARA		12
+#define KRL_INDEX_RM_WRITE_IMG		13
+#define KRL_INDEX_RM_TLK		14
+#define KRL_INDEX_RM_KL_TESTMODE	15
+#define KRL_INDEX_RM_NS_SCF		16
+
+#define RETURN_OK	0
+#define RETURN_FAIL	1
+
+/* Touch-point ABI struct -- MUST match struct rm_touch_event in
+ * include/linux/spi/rm31080a_ts.h byte-for-byte; userspace copy_from_user's
+ * this directly. Do not add/remove/reorder fields. */
+#define RM_TS_MAX_POINTS	16
+
+struct rm_touch_event {
+	unsigned char uc_touch_count;
+	unsigned char uc_id[RM_TS_MAX_POINTS];
+	unsigned char uc_tool_type[RM_TS_MAX_POINTS];
+	unsigned short us_x[RM_TS_MAX_POINTS];
+	unsigned short us_y[RM_TS_MAX_POINTS];
+	unsigned short us_z[RM_TS_MAX_POINTS];
+	unsigned short us_tilt_x[RM_TS_MAX_POINTS];
+	unsigned short us_tilt_y[RM_TS_MAX_POINTS];
+	unsigned char uc_slot[RM_TS_MAX_POINTS];
+	unsigned char uc_pre_tool_type[RM_TS_MAX_POINTS];
+};
+
+#define INPUT_SLOT_RESET	0x80
+#define INPUT_ID_RESET		0xFF
+#define POINT_TYPE_NONE		0x00
+#define POINT_TYPE_STYLUS	0x01
+#define POINT_TYPE_ERASER	0x02
+#define POINT_TYPE_FINGER	0x03
+#define POINT_TYPE_THUMB	0x04
+
+#define MAX_SLOT_AMOUNT		10	/* MAX_REPORT_TOUCHED_POINTS downstream */
+#define RM_INPUT_RESOLUTION_X	4096
+#define RM_INPUT_RESOLUTION_Y	4096
+
+/* RM_IOCTL_SET_PARAMETER ABI struct -- MUST match struct rm_tch_ctrl_para
+ * in include/linux/spi/rm31080a_ctrl.h byte-for-byte. Userspace copies the
+ * whole struct in one shot (rm_tch_ctrl_set_parameter()). */
+struct rm_tch_ctrl_para {
+	unsigned short u16_data_length;
+	unsigned short u16_ic_version;
+	unsigned short u16_resolution_x;
+	unsigned short u16_resolution_y;
+	unsigned char u8_active_digital_repeat_times;
+	unsigned char u8_analog_repeat_times;
+	unsigned char u8_idle_digital_repeat_times;
+	unsigned char u8_time2idle;
+	unsigned char u8_kernel_msg;
+	unsigned char u8_timer_trigger_scale;
+	unsigned char u8_idle_mode_check;
+	unsigned char u8_watch_dog_normal_cnt;
+	unsigned char u8_ns_func_enable;
+	unsigned char u8_event_report_mode;
+	unsigned char u8_idle_mode_thd;
+};
+
+/* Raw-scan-image ring buffer feeding RM_IOCTL_READ_RAW_DATA.
+ * QUEUE_COUNT / RM_RAW_DATA_LENGTH match the downstream #defines exactly
+ * (rm31080a_ts.c) -- userspace has no way to learn these, so they must be
+ * identical or the ring buffer sizing silently mismatches. */
+#define QUEUE_COUNT		128
+#define RM_RAW_DATA_LENGTH	6144
+
+/*
+ * 8-byte per-scan header prepended to each raw-data buffer, ported from
+ * the ENABLE_FREQ_HOPPING ("ENABLE_SCAN_DATA_HEADER") branch of
+ * rm_tch_read_image_data() in the L4T-forked driver. Confirmed needed:
+ * userspace's RM_IOCTL_READ_RAW_DATA request length is
+ * ctrl.u16_data_length + QUEUE_HEADER_NUM exactly (observed 0x1228 = 4648
+ * requested vs. 4640 reported data_length -- an 8-byte gap). We don't
+ * implement frequency hopping itself (see the KRL_CMD_SET_TIMER NOTE
+ * elsewhere), so the noise-scan-channel byte always reports 0, matching
+ * downstream's own fallback when u8_ns_func_enable is off.
+ */
+#define QUEUE_HEADER_NUM	8
+#define SCAN_TYPE_MT		1
+
+/* =========================================================================
+ * Driver private state
+ * ========================================================================= */
+
+struct rm31080_data {
+	struct spi_device *spi;
+	struct miscdevice miscdev;
+	struct input_dev *input;
+
+	struct gpio_desc *gpio_reset;
+	struct gpio_desc *gpio_irq;	/* only used if the DT node doesn't
+					 * already give us spi->irq */
+	int irq;
+
+	struct regulator *avdd;	/* 3.3V analog supply */
+	struct regulator *dvdd;	/* 1.8V digital supply */
+	struct clk *clk;		/* touch clock (extern2/clk_out_2 chain) */
+
+	u32 platform_id;		/* from DT raydium,platform-id */
+	u32 gpio_select;		/* from DT raydium,gpio-select */
+
+	/* KRL bytecode tables, uploaded by userspace via
+	 * RM_IOCTL_SET_KRL_TBL. Index space is KRL_INDEX_*. */
+	u8 *krl_tbl[KRL_TBL_COUNT];
+	struct mutex krl_lock;		/* serializes rm_tch_cmd_process() */
+
+	/* raw-scan ring buffer for RM_IOCTL_READ_RAW_DATA */
+	u8 *queue;
+	u16 q_front, q_rear;
+	struct mutex q_lock;
+
+	/* staging buffer for RM_IOCTL_SET_BASELINE, burst out to the chip
+	 * by KRL_CMD_WRITE_IMG the next time a table containing it runs
+	 * (downstream: g_u8_update_baseline / rm_tch_write_image_data()) */
+	u8 *baseline;
+	bool baseline_pending;
+
+	struct workqueue_struct *wq;
+	struct work_struct irq_work;
+
+	struct pid *hal_pid;		/* registered via RM_IOCTL_SET_HAL_PID */
+
+	struct rm_tch_ctrl_para ctrl;	/* from RM_IOCTL_SET_PARAMETER */
+
+	bool init_service;		/* RM_IOCTL_INIT_SERVICE seen */
+	bool init_finished;		/* between INIT_START/INIT_END */
+	bool calc_finished;		/* RM_IOCTL_FINISH_CALC seen */
+	bool is_suspended;
+	bool spi_locked;
+	u8 last_touch_count;
+
+	/* NOTE: downstream's u8_scan_mode_state state machine
+	 * (ACTIVE/PRE_IDLE/IDLE) is a power-saving optimisation that lets
+	 * the chip free-run without an IRQ round trip per sample. This port
+	 * always behaves as if in RM_SCAN_ACTIVE_MODE: every IRQ does
+	 * clear-int + scan-start + read-image + signal. This is functionally
+	 * correct (same data path the userspace HAL already exercises,
+	 * downstream's own default mode) but skips the idle/auto-scan power
+	 * optimisation. Revisit if standby power draw with the screen on
+	 * but idle turns out to matter. */
+
+	/*
+	 * Ported from ts_timer_triggle/ts_timer_triggle_function +
+	 * rm_timer_work_handler + rm_watchdog_work_function in
+	 * rm31080a_ts.c. This is NOT an optional resilience feature: the
+	 * *first* execution of the WATCHDOG table is, in practice, part of
+	 * bringing the chip up into active scanning after
+	 * SET_VARIABLE(WATCHDOG_FLAG, enable) -- disabling this subsystem
+	 * outright (as an earlier diagnostic build of this driver did)
+	 * leaves the chip never scanning at all. The 1Hz tick itself runs
+	 * unconditionally from probe() to remove(), exactly like
+	 * add_timer(&ts_timer_triggle) at the end of rm_tch_spi_probe();
+	 * only the watchdog-table execution inside it is gated by
+	 * watchdog_enable (== downstream's u8_watch_dog_enable).
+	 */
+	struct delayed_work timer_work;	/* ts_timer_triggle_function, HZ period */
+	u32 timer_trigger_cnt;			/* rm_timer_trigger_function's u32TimerCnt,
+						 * downsampled by ctrl.u8_timer_trigger_scale */
+	bool watchdog_enable;			/* g_st_ts.u8_watch_dog_enable */
+	bool watchdog_flg;			/* g_st_ts.u8_watch_dog_flg: "run the
+						 * table on the next tick" request,
+						 * settable directly via
+						 * RM_IOCTL_WATCH_DOG too */
+	u32 watchdog_cnt;			/* g_st_ts.u32_watch_dog_cnt */
+	u32 watchdog_time;			/* g_st_ts.u32_watch_dog_time, in
+						 * post-downsampling ticks; arg>>16
+						 * from SET_VARIABLE(WATCHDOG_FLAG) */
+};
+
+/* Only one touch chip in the system; the KRL interpreter and a couple of
+ * legacy-shaped helpers need a single global pointer the way the
+ * downstream driver used g_spi/g_input_dev/g_st_ts. */
+static struct rm31080_data *g_rm;
+
+/* =========================================================================
+ * Low-level SPI transfers
+ *
+ * Ported from rm_tch_spi_read() / rm_tch_spi_write() / dev_read() /
+ * dev_write() in rm31080a_ts.c. The read path is NOT a plain passthrough:
+ * downstream ORs 0x80 into the address byte to mark it as a read, and
+ * performs the address-write and data-read as two phases of a single
+ * spi_sync() (chip select stays asserted across both). The write path is a
+ * literal single spi_write() of whatever bytes are handed to it.
+ * ========================================================================= */
+
+static int rm31080_spi_read(struct rm31080_data *rm, u8 addr, u8 *rxbuf, size_t len)
+{
+	struct spi_transfer x[2] = { };
+	struct spi_message m;
+	u8 addr_byte = addr | 0x80;
+	int ret;
+
+	if (rm->spi_locked) {
+		memset(rxbuf, 0, len);
+		return RETURN_OK;
+	}
+
+	spi_message_init(&m);
+	x[0].tx_buf = &addr_byte;
+	x[0].len = 1;
+	spi_message_add_tail(&x[0], &m);
+	x[1].rx_buf = rxbuf;
+	x[1].len = len;
+	spi_message_add_tail(&x[1], &m);
+
+	ret = spi_sync(rm->spi, &m);
+	if (ret) {
+		dev_err(&rm->spi->dev, "%s: spi_sync failed: %d\n", __func__, ret);
+		return RETURN_FAIL;
+	}
+	return RETURN_OK;
+}
+
+static int rm31080_spi_write(struct rm31080_data *rm, u8 *txbuf, size_t len)
+{
+	int ret;
+
+	if (rm->spi_locked)
+		return RETURN_OK;
+
+	ret = spi_write(rm->spi, txbuf, len);
+	if (ret) {
+		dev_err(&rm->spi->dev, "%s: spi_write failed: %d\n", __func__, ret);
+		return RETURN_FAIL;
+	}
+	return RETURN_OK;
+}
+
+static int rm31080_spi_byte_write(struct rm31080_data *rm, u8 addr, u8 val)
+{
+	u8 buf[2] = { addr, val };
+
+	return rm31080_spi_write(rm, buf, 2);
+}
+
+static int rm31080_spi_burst_write(struct rm31080_data *rm, u8 reg, u8 *txbuf, size_t len)
+{
+	u8 *tmp;
+	int ret;
+
+	tmp = kmalloc(len + 1, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+	tmp[0] = reg;
+	memcpy(tmp + 1, txbuf, len);
+	ret = rm31080_spi_write(rm, tmp, len + 1);
+	kfree(tmp);
+	return ret;
+}
+
+/* =========================================================================
+ * Realtime signal delivery to the registered HAL pid
+ * Ported from rm_tch_ts_send_signal(). si_code MUST be SI_QUEUE (not
+ * SI_KERNEL) or the realtime payload (si_int) does not reach the
+ * userspace handler -- this is exactly the downstream comment/trick,
+ * kept intact.
+ * ========================================================================= */
+
+static int rm31080_send_signal(struct rm31080_data *rm, int info)
+{
+	struct kernel_siginfo sig = { };
+	struct task_struct *t;
+	int ret;
+
+	if (!rm->hal_pid)
+		return RETURN_FAIL;
+
+	sig.si_signo = RM_TS_SIGNAL;
+	sig.si_code = SI_QUEUE;
+	sig.si_int = info;
+
+	rcu_read_lock();
+	t = pid_task(rm->hal_pid, PIDTYPE_PID);
+	if (!t) {
+		rcu_read_unlock();
+		dev_err(&rm->spi->dev, "%s: HAL pid is gone\n", __func__);
+		return RETURN_FAIL;
+	}
+	get_task_struct(t);
+	rcu_read_unlock();
+
+	ret = send_sig_info(RM_TS_SIGNAL, &sig, t);
+	put_task_struct(t);
+
+	if (ret)
+		dev_err(&rm->spi->dev, "%s: send_sig_info failed: %d\n", __func__, ret);
+	return ret;
+}
+
+/* =========================================================================
+ * KRL bytecode interpreter
+ *
+ * Ported from rm_tch_cmd_process() plus KRL_CMD_CONFIG_3V3_Handler() /
+ * KRL_CMD_CONFIG_1V8_Handler() in rm31080a_ts.c. This executes one "case"
+ * (a named sub-sequence, e.g. "resume") out of one uploaded table
+ * (identified by KRL_INDEX_*). Table layout, faithfully preserved:
+ *
+ *   byte 0        : length high byte (0 if table < 256 bytes)
+ *   byte 1        : length low byte
+ *   byte 2        : case_count - 1 (number of "case" sub-sequences)
+ *   byte 3..N     : one length-prefixed byte per case, giving the
+ *                   instruction count for that case
+ *   thereafter    : case_count sequences of (instruction_count * 3)-byte
+ *                   instructions, each instruction = { cmd, addr/sub_cmd,
+ *                   data }
+ *
+ * u8reg is the interpreter's single scratch register, exactly as
+ * downstream (a full register file was never needed for these tables).
+ * ========================================================================= */
+
+static int krl_config_3v3(struct rm31080_data *rm, u8 sub_cmd, u8 on_off)
+{
+	int ret = RETURN_FAIL;
+
+	if (sub_cmd == KRL_SUB_CMD_SET_3V3_REGULATOR) {
+		if (!rm->avdd)
+			return RETURN_FAIL;
+		ret = on_off ? regulator_enable(rm->avdd) : regulator_disable(rm->avdd);
+	} else if (sub_cmd == KRL_SUB_CMD_SET_3V3_GPIO) {
+		/* NOTE: downstream also supported a discrete GPIO-switched
+		 * 3.3V rail (pdata->gpio_3v3) instead of a regulator. Our DT
+		 * always models this as a regulator (avdd-supply), so this
+		 * branch is intentionally unimplemented; add a gpio_desc
+		 * here if a board ever needs it. */
+		dev_warn(&rm->spi->dev, "KRL CONFIG_3V3 GPIO sub-cmd unsupported\n");
+		ret = RETURN_FAIL;
+	}
+	return ret;
+}
+
+static int krl_config_1v8(struct rm31080_data *rm, u8 sub_cmd, u8 on_off)
+{
+	int ret = RETURN_FAIL;
+
+	if (sub_cmd == KRL_SUB_CMD_SET_1V8_REGULATOR) {
+		if (!rm->dvdd)
+			return RETURN_FAIL;
+		ret = on_off ? regulator_enable(rm->dvdd) : regulator_disable(rm->dvdd);
+	} else if (sub_cmd == KRL_SUB_CMD_SET_1V8_GPIO) {
+		dev_warn(&rm->spi->dev, "KRL CONFIG_1V8 GPIO sub-cmd unsupported\n");
+		ret = RETURN_FAIL;
+	}
+	return ret;
+}
+
+/* KRL_CMD_READ_IMG needs a destination buffer that isn't part of the
+ * generic 3-byte instruction encoding (downstream stashes it in a global,
+ * g_pu8_burstread_buf, set just before calling into the interpreter). Do
+ * the same thing here, scoped as file-static state guarded by krl_lock
+ * (rm31080_cmd_process() holds it for the whole call). */
+static u8 *rm31080_img_dest;
+static size_t rm31080_img_len;
+
+/*
+ * rm31080_cmd_process - execute one case of one uploaded KRL table
+ * @rm:       driver state
+ * @sel_case: which case (0-based) within the table to run
+ * @tbl:      table bytes (as uploaded via RM_IOCTL_SET_KRL_TBL)
+ *
+ * Returns RETURN_OK (0) on success, RETURN_FAIL (1) on the first failing
+ * instruction (matching downstream's early-exit behaviour).
+ */
+static int rm31080_cmd_process(struct rm31080_data *rm, u8 sel_case, u8 *tbl)
+{
+	u16 j, str_idx, tbl_len;
+	u8 i, reg = 0;
+	int ret = RETURN_FAIL;
+
+	if (!tbl)
+		return RETURN_FAIL;
+
+	mutex_lock(&rm->krl_lock);
+
+	if (tbl[KRL_TBL_FIELD_POS_LEN_H]) {
+		tbl_len = tbl[KRL_TBL_FIELD_POS_LEN_H];
+		tbl_len <<= 8;
+		tbl_len |= tbl[KRL_TBL_FIELD_POS_LEN_L];
+	} else {
+		tbl_len = tbl[KRL_TBL_FIELD_POS_LEN_L];
+	}
+
+	if (tbl_len < 3) {
+		mutex_unlock(&rm->krl_lock);
+		return RETURN_FAIL;
+	}
+
+	str_idx = KRL_TBL_FIELD_POS_CASE_NUM + tbl[KRL_TBL_FIELD_POS_CASE_NUM] + 1;
+	for (i = 0; i < sel_case; i++)
+		str_idx += tbl[i + KRL_TBL_FIELD_POS_CMD_NUM] * KRL_TBL_CMD_LEN;
+
+	for (i = 0; i < tbl[sel_case + KRL_TBL_FIELD_POS_CMD_NUM]; i++) {
+		u8 cmd, p_addr, p_sub, p_data;
+
+		j = str_idx + (KRL_TBL_CMD_LEN * i);
+		cmd = tbl[j];
+		p_addr = tbl[j + 1];
+		p_sub = tbl[j + 1];
+		p_data = tbl[j + 2];
+		ret = RETURN_FAIL;
+
+		switch (cmd) {
+		case KRL_CMD_READ:
+			ret = rm31080_spi_read(rm, p_addr, &reg, 1);
+			break;
+		case KRL_CMD_WRITE_WO_DATA:
+			ret = rm31080_spi_byte_write(rm, p_addr, reg);
+			break;
+		case KRL_CMD_WRITE_W_DATA:
+			ret = rm31080_spi_byte_write(rm, p_addr, p_data);
+			break;
+		case KRL_CMD_IF_AND_OR:
+			if (reg & p_addr)
+				reg |= p_data;
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_AND:
+			reg &= p_data;
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_OR:
+			reg |= p_data;
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_NOT:
+			reg = ~reg;
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_XOR:
+			reg ^= p_data;
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_DRAM_INIT:
+			rm31080_spi_byte_write(rm, 0x01, 0x00);
+			ret = rm31080_spi_byte_write(rm, 0x02, 0x00);
+			break;
+		case KRL_CMD_READ_IMG:
+			/* Callers that need this (rm31080_read_image()) must
+			 * pre-stage rm31080_img_dest/rm31080_img_len before
+			 * invoking this table; mirrors downstream stashing
+			 * the destination in the global g_pu8_burstread_buf
+			 * before calling rm_tch_cmd_process(). */
+			if (!rm31080_img_dest) {
+				ret = RETURN_FAIL;
+				break;
+			}
+			ret = rm31080_spi_read(rm, p_addr, rm31080_img_dest, rm31080_img_len);
+			break;
+		case KRL_CMD_WRITE_IMG:
+			/* Streams the baseline image most recently staged by
+			 * RM_IOCTL_SET_BASELINE (downstream:
+			 * g_u8_update_baseline / rm_tch_write_image_data()).
+			 * If nothing has been staged this is a no-op success,
+			 * matching downstream's b_bl_updated guard in
+			 * rm_tch_ctrl_enter_auto_mode(). */
+			if (!rm->baseline_pending) {
+				ret = RETURN_OK;
+				break;
+			}
+			ret = rm31080_spi_burst_write(rm, p_addr, rm->baseline,
+						       rm->ctrl.u16_data_length ?
+						       rm->ctrl.u16_data_length : RM_RAW_DATA_LENGTH);
+			if (!ret)
+				rm->baseline_pending = false;
+			break;
+		case KRL_CMD_SEND_SIGNAL:
+			ret = rm31080_send_signal(rm, p_data);
+			break;
+		case KRL_CMD_CONFIG_RST:
+			/* p_data here is a literal physical pin level, exactly
+			 * as downstream's raw gpio_direction_output()/
+			 * gpio_set_value() treated it (0=drive low,
+			 * 1=drive high) -- these tables were authored against
+			 * that non-polarity-aware legacy API, not gpiod's
+			 * active-low-translating one. Use the _raw variants
+			 * so a table byte of 0 always means "physically low"
+			 * regardless of the reset-gpios ACTIVE_LOW flag in DT,
+			 * matching what downstream actually did on the wire.
+			 * (Our own probe()-driven reset pulse, above, is
+			 * hand-written and uses the polarity-aware API
+			 * instead -- don't conflate the two.) */
+			if (p_sub == KRL_SUB_CMD_SET_RST_GPIO) {
+				gpiod_direction_output_raw(rm->gpio_reset, p_data);
+				ret = RETURN_OK;
+			} else if (p_sub == KRL_SUB_CMD_SET_RST_VALUE) {
+				gpiod_set_raw_value_cansleep(rm->gpio_reset, p_data);
+				ret = RETURN_OK;
+			}
+			break;
+		case KRL_CMD_CONFIG_3V3:
+			ret = krl_config_3v3(rm, p_sub, p_data);
+			break;
+		case KRL_CMD_CONFIG_1V8:
+			ret = krl_config_1v8(rm, p_sub, p_data);
+			break;
+		case KRL_CMD_CONFIG_CLK:
+			if (p_sub == KRL_SUB_CMD_SET_CLK && rm->clk) {
+				if (p_data)
+					ret = clk_prepare_enable(rm->clk);
+				else {
+					clk_disable_unprepare(rm->clk);
+					ret = RETURN_OK;
+				}
+			}
+			break;
+		case KRL_CMD_CONFIG_CS:
+			/* NOTE: downstream's manual chip-select toggle is
+			 * gated behind CS_SUPPORT (off by default upstream
+			 * too); treat as a no-op success like downstream's
+			 * #else branch. */
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_SET_TIMER:
+			/* NOTE: downstream's slow-scan re-arm timer
+			 * (init/add/del) is part of the idle/auto-scan power
+			 * path we're not implementing yet (see the NOTE on
+			 * scan_mode_state above); accept and no-op. */
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_MSLEEP: {
+			u32 ms = (u16)(p_data | (p_sub << 8));
+
+			usleep_range(ms * 1000, ms * 1000 + 200);
+			ret = RETURN_OK;
+			break;
+		}
+		case KRL_CMD_FLUSH_QU:
+			/* our workqueue is flushed synchronously by design
+			 * (see rm31080_irq_work); nothing to do here */
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_WRITE_W_COUNT:
+			/* NOTE: downstream ORs in a repeat-counter maintained
+			 * by rm_set_repeat_times()/RM_IOCTL_SET_VARIABLE
+			 * (RM_VARIABLE_REPEAT). Repeat-counter state isn't
+			 * tracked in this port yet; falls back to writing
+			 * the scratch register unmodified. */
+			ret = rm31080_spi_byte_write(rm, p_addr, reg);
+			break;
+		case KRL_CMD_RETURN_RESULT:
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_RETURN_VALUE:
+			ret = RETURN_OK;
+			break;
+		case KRL_CMD_CONFIG_IRQ:
+			if (p_sub == KRL_SUB_CMD_SET_IRQ && rm->irq) {
+				if (p_data)
+					enable_irq(rm->irq);
+				else
+					disable_irq(rm->irq);
+				ret = RETURN_OK;
+			}
+			break;
+		case KRL_CMD_DUMMY:
+			ret = RETURN_OK;
+			break;
+		default:
+			break;
+		}
+
+		if (ret) {
+			dev_err(&rm->spi->dev,
+				"KRL cmd 0x%x failed (addr/sub=0x%x data=0x%x) in case %u\n",
+				cmd, p_addr, p_data, sel_case);
+			break;
+		}
+	}
+
+	mutex_unlock(&rm->krl_lock);
+	return ret;
+}
+
+static int rm31080_read_image(struct rm31080_data *rm, u8 *dest, size_t data_len)
+{
+	int ret;
+
+	dest[0] = SCAN_TYPE_MT;
+	dest[1] = (u8)(data_len >> 8);
+	dest[2] = (u8)data_len;
+	dest[3] = 0;	/* noise-scan channel select; 0 since we don't implement
+			 * frequency hopping (u8_ns_func_enable always "off") */
+	dest[4] = 0;	/* self-test mode type; 0 (RM_TEST_MODE_NULL) since we
+			 * don't implement the self-test ioctls */
+	dest[5] = 0;
+	dest[6] = 0;
+	dest[7] = 0;
+
+	rm31080_img_dest = dest + QUEUE_HEADER_NUM;
+	rm31080_img_len = data_len;
+	ret = rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_READ_IMG]);
+	rm31080_img_dest = NULL;
+	return ret;
+}
+
+/* =========================================================================
+ * Raw-scan-image ring buffer (backs RM_IOCTL_READ_RAW_DATA)
+ * Ported from rm_tch_queue_*() in rm31080a_ts.c. One slot kept empty to
+ * distinguish full/empty without a separate counter, exactly as downstream.
+ * ========================================================================= */
+
+static bool rm31080_q_empty(struct rm31080_data *rm)
+{
+	return rm->q_rear == rm->q_front;
+}
+
+static bool rm31080_q_full(struct rm31080_data *rm)
+{
+	if (rm->q_rear + 1 == rm->q_front)
+		return true;
+	if (rm->q_rear == QUEUE_COUNT - 1 && rm->q_front == 0)
+		return true;
+	return false;
+}
+
+static u8 *rm31080_q_enqueue_start(struct rm31080_data *rm)
+{
+	if (!rm->queue || rm31080_q_full(rm))
+		return NULL;
+	return &rm->queue[rm->q_rear * RM_RAW_DATA_LENGTH];
+}
+
+static void rm31080_q_enqueue_finish(struct rm31080_data *rm)
+{
+	rm->q_rear = (rm->q_rear == QUEUE_COUNT - 1) ? 0 : rm->q_rear + 1;
+}
+
+static u8 *rm31080_q_dequeue_start(struct rm31080_data *rm)
+{
+	if (rm31080_q_empty(rm))
+		return NULL;
+	return &rm->queue[rm->q_front * RM_RAW_DATA_LENGTH];
+}
+
+static void rm31080_q_dequeue_finish(struct rm31080_data *rm)
+{
+	rm->q_front = (rm->q_front == QUEUE_COUNT - 1) ? 0 : rm->q_front + 1;
+}
+
+static long rm31080_q_read_raw_data(struct rm31080_data *rm, void __user *p, u32 len)
+{
+	u8 *slot;
+	long ret;
+
+	mutex_lock(&rm->q_lock);
+	slot = rm31080_q_dequeue_start(rm);
+	if (!slot) {
+		mutex_unlock(&rm->q_lock);
+		return RETURN_FAIL;
+	}
+	ret = copy_to_user(p, slot, len) ? RETURN_FAIL : RETURN_OK;
+	if (!ret)
+		rm31080_q_dequeue_finish(rm);
+	mutex_unlock(&rm->q_lock);
+	return ret;
+}
+
+/* =========================================================================
+ * Touch-point injection (RM_IOCTL_REPORT_POINT)
+ * Ported from raydium_report_pointer() in rm31080a_ts.c, Type-B multitouch
+ * path only (INPUT_PROTOCOL_CURRENT_SUPPORT == INPUT_PROTOCOL_TYPE_B is the
+ * only variant downstream actually built).
+ * ========================================================================= */
+
+static void rm31080_report_pointer(struct rm31080_data *rm, struct rm_touch_event *tp)
+{
+	unsigned int tool = MT_TOOL_FINGER;
+	unsigned int btn = BTN_TOOL_FINGER;
+	int max_x, max_y, count, i;
+
+	if (rm->ctrl.u16_resolution_x && rm->ctrl.u16_resolution_y) {
+		max_x = rm->ctrl.u16_resolution_x;
+		max_y = rm->ctrl.u16_resolution_y;
+	} else {
+		max_x = RM_INPUT_RESOLUTION_X;
+		max_y = RM_INPUT_RESOLUTION_Y;
+	}
+
+	count = max(rm->last_touch_count, tp->uc_touch_count);
+
+	if (count && !tp->uc_touch_count) {
+		rm->last_touch_count = 0;
+		for (i = 0; i < MAX_SLOT_AMOUNT; i++) {
+			input_mt_slot(rm->input, i);
+			input_mt_report_slot_state(rm->input, MT_TOOL_FINGER, false);
+			input_report_key(rm->input, BTN_TOOL_RUBBER, false);
+		}
+		input_sync(rm->input);
+		return;
+	}
+
+	if (!count)
+		return;
+
+	for (i = 0; i < count && i < MAX_SLOT_AMOUNT; i++) {
+		if (i >= tp->uc_touch_count)
+			continue;
+
+		input_mt_slot(rm->input, tp->uc_slot[i] & ~INPUT_SLOT_RESET);
+
+		if ((tp->uc_slot[i] & INPUT_SLOT_RESET) || tp->uc_id[i] == INPUT_ID_RESET) {
+			switch (tp->uc_pre_tool_type[i]) {
+			case POINT_TYPE_FINGER:
+				tool = MT_TOOL_FINGER;
+				break;
+			case POINT_TYPE_STYLUS:
+				tool = MT_TOOL_PEN;
+				break;
+			case POINT_TYPE_ERASER:
+				tool = MT_TOOL_PEN;
+				btn = BTN_TOOL_RUBBER;
+				break;
+			default:
+				break;
+			}
+			input_mt_report_slot_state(rm->input, tool, false);
+			if (tp->uc_pre_tool_type[i] == POINT_TYPE_ERASER)
+				input_report_key(rm->input, btn, false);
+		}
+
+		if (tp->uc_id[i] == INPUT_ID_RESET)
+			continue;
+
+		switch (tp->uc_tool_type[i]) {
+		case POINT_TYPE_FINGER:
+			tool = MT_TOOL_FINGER;
+			break;
+		case POINT_TYPE_STYLUS:
+			tool = MT_TOOL_PEN;
+			break;
+		case POINT_TYPE_ERASER:
+			tool = MT_TOOL_PEN;
+			btn = BTN_TOOL_RUBBER;
+			break;
+		default:
+			break;
+		}
+
+		input_mt_report_slot_state(rm->input, tool, true);
+		input_report_abs(rm->input, ABS_MT_POSITION_X,
+				  min_t(u16, tp->us_x[i], max_x - 1));
+		input_report_abs(rm->input, ABS_MT_POSITION_Y,
+				  min_t(u16, tp->us_y[i], max_y - 1));
+		input_report_abs(rm->input, ABS_MT_PRESSURE, tp->us_z[i]);
+
+		if (tp->uc_tool_type[i] == POINT_TYPE_ERASER)
+			input_report_key(rm->input, btn, true);
+	}
+
+	rm->last_touch_count = tp->uc_touch_count;
+	input_sync(rm->input);
+}
+
+/* =========================================================================
+ * IRQ handling
+ *
+ * Ported from rm_tch_irq() + rm_work_handler() in rm31080a_ts.c, collapsed
+ * to the RM_SCAN_ACTIVE_MODE path (see the NOTE on scan_mode_state above):
+ * every touch IRQ does clear-int, scan-start, pulls one scan image into
+ * the ring buffer, then signals the HAL.
+ * ========================================================================= */
+
+static void rm31080_irq_work(struct work_struct *work)
+{
+	struct rm31080_data *rm = container_of(work, struct rm31080_data, irq_work);
+	u8 *slot;
+	int clear_ret, scan_ret, img_ret = -1;
+
+	if (!rm->init_finished || rm->is_suspended) {
+		dev_dbg_ratelimited(&rm->spi->dev,
+			"irq_work: skipped (init_finished=%d is_suspended=%d)\n",
+			rm->init_finished, rm->is_suspended);
+		return;
+	}
+
+	clear_ret = rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_CLEARINT]);
+	scan_ret = rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_SCANSTART]);
+
+	mutex_lock(&rm->q_lock);
+	slot = rm31080_q_enqueue_start(rm);
+	mutex_unlock(&rm->q_lock);
+
+	if (slot) {
+		img_ret = rm31080_read_image(rm, slot, rm->ctrl.u16_data_length ?
+					      rm->ctrl.u16_data_length : RM_RAW_DATA_LENGTH);
+		if (!img_ret) {
+			mutex_lock(&rm->q_lock);
+			rm31080_q_enqueue_finish(rm);
+			mutex_unlock(&rm->q_lock);
+		}
+	}
+
+	dev_dbg_ratelimited(&rm->spi->dev,
+		"irq_work: clear_int=%d scan_start=%d slot=%s read_image=%d data_length=%u\n",
+		clear_ret, scan_ret, slot ? "ok" : "NULL(queue full?)", img_ret,
+		rm->ctrl.u16_data_length);
+
+	if (rm->calc_finished) {
+		rm->calc_finished = false;
+		rm31080_send_signal(rm, RM_SIGNAL_INTR);
+	}
+}
+
+static irqreturn_t rm31080_irq(int irq, void *data)
+{
+	struct rm31080_data *rm = data;
+	bool will_process = rm->init_service && rm->init_finished && !rm->is_suspended;
+
+	dev_dbg_ratelimited(&rm->spi->dev,
+		"hw irq fired (init_service=%d init_finished=%d is_suspended=%d -> %s)\n",
+		rm->init_service, rm->init_finished, rm->is_suspended,
+		will_process ? "queued" : "DROPPED");
+
+	if (will_process)
+		queue_work(rm->wq, &rm->irq_work);
+
+	return IRQ_HANDLED;
+}
+
+/* =========================================================================
+ * Timer tick / watchdog
+ *
+ * Ported from ts_timer_triggle_function() + rm_timer_work_handler() +
+ * rm_watchdog_work_function() in rm31080a_ts.c. Runs unconditionally every
+ * HZ (1s, matching downstream's TS_TIMER_PERIOD) for the lifetime of the
+ * device -- this is NOT gated by watchdog_enable; only the table execution
+ * inside it is. See the long NOTE on the struct fields above for why this
+ * matters: this is where the very first "start scanning" kick happens.
+ * ========================================================================= */
+
+static void rm31080_timer_work(struct work_struct *work)
+{
+	struct rm31080_data *rm = container_of(to_delayed_work(work),
+						struct rm31080_data, timer_work);
+	bool triggered;
+
+	dev_dbg_ratelimited(&rm->spi->dev,
+		"timer tick: init_finished=%d is_suspended=%d watchdog_enable=%d watchdog_cnt=%u watchdog_time=%u\n",
+		rm->init_finished, rm->is_suspended, rm->watchdog_enable,
+		rm->watchdog_cnt, rm->watchdog_time);
+
+	/* rm_timer_trigger_function(): downsample the 1Hz tick by
+	 * ctrl.u8_timer_trigger_scale (0 = run every tick). */
+	if (rm->timer_trigger_cnt++ < rm->ctrl.u8_timer_trigger_scale) {
+		triggered = false;
+	} else {
+		rm->timer_trigger_cnt = 0;
+		triggered = true;
+	}
+
+	if (triggered && rm->init_finished && !rm->is_suspended) {
+		/* rm_watchdog_work_function(RM_SCAN_ACTIVE_MODE) -- our
+		 * ACTIVE-only simplification means we always take the
+		 * ACTIVE_MODE branch (see the NOTE on scan_mode_state
+		 * above), never the IDLE_MODE one that instead sets
+		 * b_watch_dog_check + RM_SIGNAL_WATCH_DOG_CHECK. */
+		if (rm->watchdog_enable) {
+			if (rm->watchdog_cnt++ >= rm->watchdog_time) {
+				rm->watchdog_cnt = 0;
+				rm->watchdog_flg = true;
+			}
+
+			if (rm->watchdog_flg) {
+				int wd_ret;
+
+				dev_dbg(&rm->spi->dev,
+					"watchdog: executing KRL_INDEX_RM_WATCHDOG table now (watchdog_time=%u)\n",
+					rm->watchdog_time);
+
+				/*
+				 * Mutual exclusion against a real scan cycle
+				 * here needs to be real hardware IRQ masking,
+				 * not the software is_suspended flag downstream
+				 * uses (and this port originally matched):
+				 * rm31080_irq()'s is_suspended check drops a
+				 * real touch IRQ outright with no way to
+				 * recover it, and if the chip's INT line is
+				 * level-held until explicitly cleared, a
+				 * dropped event leaves it stuck asserted
+				 * forever -- no further *rising* edges for our
+				 * edge-triggered IRQ, ever (confirmed by
+				 * testing: two independent runs where the chip
+				 * went permanently silent immediately after a
+				 * watchdog cycle, every time).
+				 *
+				 * disable_irq()/enable_irq() has none of that
+				 * problem. Verified against
+				 * drivers/gpio/gpio-tegra.c: irq_mask() only
+				 * clears the GPIO_INT_ENB bit, never touches
+				 * GPIO_INT_STA; the dispatcher ANDs
+				 * (STA & ENB), and STA latches on a real edge
+				 * regardless of ENB. A touch landing while
+				 * masked stays latched in hardware and fires
+				 * correctly the instant we unmask -- exactly
+				 * the "pause without losing events" behaviour
+				 * we actually need, provided by the interrupt
+				 * controller instead of reimplemented (badly)
+				 * in software.
+				 */
+				disable_irq(rm->irq);
+				wd_ret = rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_WATCHDOG]);
+				enable_irq(rm->irq);
+				rm->watchdog_flg = false;
+
+				dev_dbg(&rm->spi->dev,
+					"watchdog: table execution finished, ret=%d\n", wd_ret);
+			}
+		}
+	}
+
+	schedule_delayed_work(&rm->timer_work, HZ);
+}
+
+/* RM_IOCTL_WATCH_DOG: just requests a table run on the next tick, exactly
+ * like downstream -- does NOT run the table synchronously. */
+static void rm31080_watchdog_request(struct rm31080_data *rm)
+{
+	dev_dbg(&rm->spi->dev, "watchdog: table run requested via RM_IOCTL_WATCH_DOG\n");
+	rm->watchdog_flg = true;
+}
+
+/*
+ * RM_VARIABLE_WATCHDOG_FLAG (SET_VARIABLE): ported from
+ * rm_ctrl_watchdog_func(). arg bit 0 = enable, arg >> 16 = watchdog period
+ * in (downsampled) ticks. Disabling sets the period to "never".
+ */
+static void rm31080_watchdog_configure(struct rm31080_data *rm, unsigned long arg)
+{
+	rm->watchdog_flg = false;
+	rm->watchdog_cnt = 0;
+
+	if (arg & 0x01) {
+		rm->watchdog_enable = true;
+		rm->watchdog_time = arg >> 16;
+	} else {
+		rm->watchdog_enable = false;
+		rm->watchdog_time = 0xFFFFFFFF;
+	}
+
+	dev_dbg(&rm->spi->dev,
+		"watchdog: configured via SET_VARIABLE, arg=0x%lx -> enable=%d period=%u (timer_trigger_scale=%u)\n",
+		arg, rm->watchdog_enable, rm->watchdog_time, rm->ctrl.u8_timer_trigger_scale);
+}
+
+/* =========================================================================
+ * misc device file operations
+ * ========================================================================= */
+
+static int rm31080_open(struct inode *inode, struct file *filp)
+{
+	filp->private_data = g_rm;
+	return 0;
+}
+
+static int rm31080_release(struct inode *inode, struct file *filp)
+{
+	return 0;
+}
+
+/*
+ * read(fd, buf, n): userspace pre-populates buf[0] with the register
+ * address it wants to read (see bReadSensor()/raydium_spi_read() in the
+ * userspace HAL); the kernel echoes that byte's value as the SPI
+ * address, ORs in the read bit, and overwrites buf with the result.
+ * Ported from dev_read() in rm31080a_ts.c -- including reading buf[0]
+ * from the not-yet-copied-in user buffer, which is exactly what
+ * downstream does (relying on the previous read()'s leftover content,
+ * or whatever the HAL pre-seeded userspace-side).
+ */
+static ssize_t rm31080_read(struct file *filp, char __user *buf, size_t count, loff_t *pos)
+{
+	struct rm31080_data *rm = filp->private_data;
+	u8 *kbuf;
+	u8 addr;
+	ssize_t status;
+
+	if (!count)
+		return 0;
+
+	if (get_user(addr, (u8 __user *)buf))
+		return -EFAULT;
+
+	kbuf = kmalloc(count, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	if (rm31080_spi_read(rm, addr, kbuf, count)) {
+		status = -EFAULT;
+	} else {
+		status = copy_to_user(buf, kbuf, count) ? -EFAULT : count;
+	}
+
+	kfree(kbuf);
+	return status;
+}
+
+/* write(fd, buf, n): literal passthrough, buf[0] = register address
+ * (no read bit), buf[1..] = data. Ported from dev_write(). */
+static ssize_t rm31080_write(struct file *filp, const char __user *buf, size_t count, loff_t *pos)
+{
+	struct rm31080_data *rm = filp->private_data;
+	u8 *kbuf;
+	ssize_t status;
+
+	if (!count)
+		return 0;
+
+	kbuf = kmalloc(count, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	if (copy_from_user(kbuf, buf, count)) {
+		status = -EFAULT;
+	} else {
+		status = rm31080_spi_write(rm, kbuf, count) ? -EFAULT : count;
+	}
+
+	kfree(kbuf);
+	return status;
+}
+
+/* =========================================================================
+ * ioctl dispatch
+ * Ported from dev_ioctl() in rm31080a_ts.c. index = upper 16 bits of cmd,
+ * matching userspace's (index << 16) | ioctl packing.
+ * ========================================================================= */
+
+static u32 rm31080_get_variable(struct rm31080_data *rm, unsigned int index, u8 __user *p)
+{
+	u8 val;
+
+	switch (index) {
+	case RM_VARIABLE_PLATFORM_ID:
+		val = (u8)rm->platform_id;
+		break;
+	case RM_VARIABLE_GPIO_SELECT:
+		val = (u8)rm->gpio_select;
+		break;
+	case RM_VARIABLE_CHECK_SPI_LOCK:
+		val = rm->spi_locked | rm->is_suspended;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return copy_to_user(p, &val, 1) ? RETURN_FAIL : RETURN_OK;
+}
+
+static void rm31080_set_variable(struct rm31080_data *rm, unsigned int index, unsigned long arg)
+{
+	switch (index) {
+	case RM_VARIABLE_AUTOSCAN_FLAG:
+		/* NOTE: no-op under the always-active scan model; see the
+		 * NOTE on scan_mode_state above. */
+		break;
+	case RM_VARIABLE_WATCHDOG_FLAG:
+		rm31080_watchdog_configure(rm, arg);
+		break;
+	case RM_VARIABLE_SET_SPI_UNLOCK:
+		rm->spi_locked = false;
+		break;
+	case RM_VARIABLE_VERSION:
+	case RM_VARIABLE_TEST_VERSION:
+	case RM_VARIABLE_SELF_TEST_RESULT:
+	case RM_VARIABLE_SCRIBER_FLAG:
+	case RM_VARIABLE_IDLEMODECHECK:
+	case RM_VARIABLE_REPEAT:
+	case RM_VARIABLE_SET_WAKE_UNLOCK:
+	case RM_VARIABLE_TOUCHFILE_STATUS:
+	case RM_VARIABLE_TOUCH_EVENT:
+	default:
+		/* NOTE: these are diagnostic/self-test/uevent hooks in
+		 * downstream (rm_tch_enter_test_mode(),
+		 * rm_tch_generate_event(), frequency-hopping params, ...)
+		 * that don't affect the basic touch data path. Accepted
+		 * and otherwise ignored for now. */
+		break;
+	}
+}
+
+static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	struct rm31080_data *rm = filp->private_data;
+	void __user *argp = (void __user *)(uintptr_t)(arg & MASK_USER_SPACE_POINTER);
+	unsigned int index = (cmd >> 16) & 0xFFFF;
+	long ret = RETURN_OK;
+
+	switch (cmd & 0xFFFF) {
+	case RM_IOCTL_REPORT_POINT: {
+		struct rm_touch_event *tp = kmalloc(sizeof(*tp), GFP_KERNEL);
+
+		if (!tp)
+			return -ENOMEM;
+		if (copy_from_user(tp, argp, sizeof(*tp))) {
+			kfree(tp);
+			return -EFAULT;
+		}
+		rm31080_report_pointer(rm, tp);
+		kfree(tp);
+		break;
+	}
+	case RM_IOCTL_FINISH_CALC:
+		rm->calc_finished = true;
+		break;
+	case RM_IOCTL_READ_RAW_DATA:
+		ret = rm31080_q_read_raw_data(rm, argp, index);
+		ret = (ret == RETURN_OK) ? 1 : 0; /* ts.default.so checks nonzero = frame available */
+		break;
+	case RM_IOCTL_SET_HAL_PID:
+		if (rm->hal_pid)
+			put_pid(rm->hal_pid);
+		rm->hal_pid = get_pid(find_get_pid((pid_t)arg));
+		break;
+	case RM_IOCTL_WATCH_DOG:
+		rm31080_watchdog_request(rm);
+		break;
+	case RM_IOCTL_GET_VARIABLE:
+		ret = rm31080_get_variable(rm, index, argp);
+		break;
+	case RM_IOCTL_INIT_START:
+		rm->init_finished = false;
+		flush_workqueue(rm->wq);
+		break;
+	case RM_IOCTL_INIT_END:
+		rm->init_finished = true;
+		rm->calc_finished = true;
+		break;
+	case RM_IOCTL_SCRIBER_CTRL:
+		/* NOTE: scriber (palm-rejection style) mode flag; stored but
+		 * not currently consulted anywhere in this port. */
+		break;
+	case RM_IOCTL_SET_PARAMETER:
+		if (copy_from_user(&rm->ctrl, argp, sizeof(rm->ctrl)))
+			return -EFAULT;
+		if (rm->ctrl.u16_resolution_x && rm->ctrl.u16_resolution_y) {
+			input_set_abs_params(rm->input, ABS_MT_POSITION_X, 0,
+					      rm->ctrl.u16_resolution_x - 1, 0, 0);
+			input_set_abs_params(rm->input, ABS_MT_POSITION_Y, 0,
+					      rm->ctrl.u16_resolution_y - 1, 0, 0);
+			input_set_abs_params(rm->input, ABS_X, 0,
+					      rm->ctrl.u16_resolution_x - 1, 0, 0);
+			input_set_abs_params(rm->input, ABS_Y, 0,
+					      rm->ctrl.u16_resolution_y - 1, 0, 0);
+		}
+		break;
+	case RM_IOCTL_SET_BASELINE: {
+		size_t len = rm->ctrl.u16_data_length ? rm->ctrl.u16_data_length : RM_RAW_DATA_LENGTH;
+
+		if (!rm->baseline)
+			return -ENOMEM;
+		if (copy_from_user(rm->baseline, argp, len))
+			return -EFAULT;
+		rm->baseline_pending = true;
+		break;
+	}
+	case RM_IOCTL_SET_VARIABLE:
+		rm31080_set_variable(rm, index, arg);
+		break;
+	case RM_IOCTL_SET_KRL_TBL: {
+		u8 hdr[KRL_TBL_FIELD_POS_CASE_NUM];
+		u16 len;
+
+		if (index >= KRL_TBL_COUNT)
+			return -EINVAL;
+
+		/* Peek just the 2-byte length header first -- userspace's
+		 * source pointer here points into the middle of a packed,
+		 * variable-length buffer (all 16 tables concatenated); a
+		 * blind copy of the full KRL_TBL_MAX_LEN from a table that
+		 * doesn't start near the front of that buffer runs off its
+		 * end. Ported from rm_set_kernel_tbl(). */
+		if (copy_from_user(hdr, argp, sizeof(hdr)))
+			return -EFAULT;
+
+		len = hdr[KRL_TBL_FIELD_POS_LEN_H];
+		len <<= 8;
+		len |= hdr[KRL_TBL_FIELD_POS_LEN_L];
+
+		if (len < sizeof(hdr) || len > KRL_TBL_MAX_LEN)
+			return -EINVAL;
+
+		memset(rm->krl_tbl[index], 0, KRL_TBL_MAX_LEN);
+		if (copy_from_user(rm->krl_tbl[index], argp, len))
+			return -EFAULT;
+		break;
+	}
+	case RM_IOCTL_GET_SCAN_MODE: {
+		u8 val = rm->ctrl.u8_idle_mode_check;
+
+		ret = copy_to_user(argp, &val, 1) ? RETURN_FAIL : RETURN_OK;
+		break;
+	}
+	case RM_IOCTL_INIT_SERVICE:
+		rm->init_service = true;
+		break;
+	case RM_IOCTL_SET_CLK:
+		if (rm->clk) {
+			if (arg)
+				ret = clk_prepare_enable(rm->clk);
+			else
+				clk_disable_unprepare(rm->clk);
+		}
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return ret ? -EIO : 0;
+}
+
+static const struct file_operations rm31080_fops = {
+	.owner = THIS_MODULE,
+	.open = rm31080_open,
+	.release = rm31080_release,
+	.read = rm31080_read,
+	.write = rm31080_write,
+	.unlocked_ioctl = rm31080_ioctl,
+	.compat_ioctl = rm31080_ioctl,
+};
+
+/* =========================================================================
+ * input_dev open/close
+ *
+ * Ported from rm_tch_input_open()/rm_tch_input_close() in rm31080a_ts.c.
+ * The Linux input core calls .open() the moment the first reader (Xorg's
+ * evdev backend, evtest, libinput, ...) opens this device's
+ * /dev/input/eventN node, and .close() once the last reader closes it.
+ * This -- not anything tied to INIT_SERVICE/INIT_END or the KRL tables --
+ * is what downstream actually uses to gate the hardware IRQ: no consumer
+ * has the device open, no reason to be scanning. Previously missing from
+ * this port entirely, which left the IRQ masked for the driver's whole
+ * lifetime except as an incidental side effect of whatever CONFIG_IRQ
+ * opcodes happen to appear in an executed KRL table.
+ * ========================================================================= */
+
+static int rm31080_input_open(struct input_dev *input)
+{
+	struct rm31080_data *rm = input_get_drvdata(input);
+
+	dev_dbg(&rm->spi->dev, "input device opened, enabling irq %d\n", rm->irq);
+	enable_irq(rm->irq);
+	return 0;
+}
+
+static void rm31080_input_close(struct input_dev *input)
+{
+	struct rm31080_data *rm = input_get_drvdata(input);
+
+	dev_dbg(&rm->spi->dev, "input device closed, disabling irq %d\n", rm->irq);
+	disable_irq(rm->irq);
+}
+
+/* =========================================================================
+ * Probe / remove / PM
+ * ========================================================================= */
+
+static int rm31080_probe(struct spi_device *spi)
+{
+	struct device *dev = &spi->dev;
+	struct rm31080_data *rm;
+	int i, ret;
+
+	rm = devm_kzalloc(dev, sizeof(*rm), GFP_KERNEL);
+	if (!rm)
+		return -ENOMEM;
+
+	rm->spi = spi;
+	spi_set_drvdata(spi, rm);
+	mutex_init(&rm->krl_lock);
+	mutex_init(&rm->q_lock);
+	INIT_WORK(&rm->irq_work, rm31080_irq_work);
+	INIT_DELAYED_WORK(&rm->timer_work, rm31080_timer_work);
+
+	for (i = 0; i < KRL_TBL_COUNT; i++) {
+		rm->krl_tbl[i] = devm_kzalloc(dev, KRL_TBL_MAX_LEN, GFP_KERNEL);
+		if (!rm->krl_tbl[i])
+			return -ENOMEM;
+	}
+
+	rm->queue = devm_kzalloc(dev, (size_t)QUEUE_COUNT * RM_RAW_DATA_LENGTH, GFP_KERNEL);
+	if (!rm->queue)
+		return -ENOMEM;
+
+	rm->baseline = devm_kzalloc(dev, RM_RAW_DATA_LENGTH, GFP_KERNEL);
+	if (!rm->baseline)
+		return -ENOMEM;
+
+	if (of_property_read_u32(dev->of_node, "raydium,platform-id", &rm->platform_id)) {
+		dev_err(dev, "missing required raydium,platform-id property\n");
+		return -EINVAL;
+	}
+	of_property_read_u32(dev->of_node, "raydium,gpio-select", &rm->gpio_select);
+
+	/* Request already-asserted (logical 1 = physical low, given the DT
+	 * node's GPIO_ACTIVE_LOW flag): downstream's board-default pinmux
+	 * table already leaves this pin driven low (asserted) from very
+	 * early boot, before the touch driver even loads, and rm_tch_spi_probe()
+	 * explicitly re-asserts before its timed pulse. Starting anywhere
+	 * else risks a shorter/undefined reset pulse on the very first
+	 * probe. */
+	rm->gpio_reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(rm->gpio_reset))
+		return dev_err_probe(dev, PTR_ERR(rm->gpio_reset), "failed to get reset gpio\n");
+
+	rm->avdd = devm_regulator_get(dev, "avdd");
+	if (IS_ERR(rm->avdd))
+		return dev_err_probe(dev, PTR_ERR(rm->avdd), "failed to get avdd-supply\n");
+	rm->dvdd = devm_regulator_get(dev, "dvdd");
+	if (IS_ERR(rm->dvdd))
+		return dev_err_probe(dev, PTR_ERR(rm->dvdd), "failed to get dvdd-supply\n");
+
+	rm->clk = devm_clk_get(dev, NULL);
+	if (IS_ERR(rm->clk))
+		return dev_err_probe(dev, PTR_ERR(rm->clk), "failed to get touch clock\n");
+
+	/* Power/clock/reset sequence ported from rm_tch_spi_probe(): supplies
+	 * up, brief settle, hold reset low 120ms, release, settle 20ms. The
+	 * exact same numbers dmesg shows the downstream driver using. */
+	ret = regulator_enable(rm->avdd);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to enable avdd\n");
+	ret = regulator_enable(rm->dvdd);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to enable dvdd\n");
+	ret = clk_prepare_enable(rm->clk);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to enable touch clock\n");
+
+	usleep_range(5000, 6000);
+	gpiod_set_value_cansleep(rm->gpio_reset, 1); /* assert (already asserted; explicit for clarity/timing) */
+	msleep(120);
+	gpiod_set_value_cansleep(rm->gpio_reset, 0); /* release */
+	msleep(20);
+
+	spi->mode = SPI_MODE_0;
+	ret = spi_setup(spi);
+	if (ret)
+		return dev_err_probe(dev, ret, "spi_setup failed\n");
+
+	/* IRQ: prefer whatever spi->irq the core already resolved from a
+	 * standard "interrupts"/"interrupts-extended" property on the DT
+	 * node; fall back to an explicit "irq" gpio if the DTS instead wires
+	 * this the same way as the reset line. */
+	rm->irq = spi->irq;
+	if (rm->irq <= 0) {
+		rm->gpio_irq = devm_gpiod_get(dev, "irq", GPIOD_IN);
+		if (IS_ERR(rm->gpio_irq))
+			return dev_err_probe(dev, PTR_ERR(rm->gpio_irq),
+					      "no usable interrupt (neither spi->irq nor irq-gpios)\n");
+		rm->irq = gpiod_to_irq(rm->gpio_irq);
+		if (rm->irq < 0)
+			return rm->irq;
+	}
+
+	rm->wq = create_singlethread_workqueue("rm31080_ts");
+	if (!rm->wq)
+		return -ENOMEM;
+
+	/* Match downstream: IRQ is rising-edge, threaded, one-shot
+	 * (IRQF_TRIGGER_RISING | IRQF_ONESHOT in rm_tch_spi_probe()), and
+	 * starts masked (IRQF_NO_AUTOEN here vs. an explicit
+	 * rm_tch_disable_irq() call right after request_threaded_irq()
+	 * downstream -- same effect). It only gets unmasked by
+	 * rm31080_input_open() below, once something actually opens the
+	 * input device -- which is why this MUST be requested before
+	 * input_register_device() runs: that call can make the device
+	 * visible to userspace (and thus opened, and thus enable_irq()'d)
+	 * before this function returns. */
+	ret = devm_request_threaded_irq(dev, rm->irq, NULL, rm31080_irq,
+					 IRQF_TRIGGER_RISING | IRQF_ONESHOT | IRQF_NO_AUTOEN,
+					 dev_name(dev), rm);
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to request irq\n");
+		goto err_wq;
+	}
+
+	rm->input = devm_input_allocate_device(dev);
+	if (!rm->input) {
+		ret = -ENOMEM;
+		goto err_wq;
+	}
+	rm->input->name = "Raydium RM31080 Touchscreen";
+	rm->input->id.bustype = BUS_SPI;
+	rm->input->open = rm31080_input_open;
+	rm->input->close = rm31080_input_close;
+	input_set_drvdata(rm->input, rm);
+	__set_bit(EV_ABS, rm->input->evbit);
+	__set_bit(EV_KEY, rm->input->evbit);
+	__set_bit(BTN_TOOL_RUBBER, rm->input->keybit);
+	/* Capability-only, never actually reported: ported from the L4T
+	 * fork, which declares these (but never calls input_report_key/abs
+	 * on them -- verified, neither it nor android_kernel's rm31080a_ts.c
+	 * ever does) purely so classification heuristics that predate full
+	 * MT-B awareness -- notably Xorg's evdev driver's
+	 * MatchIsTouchscreen -- recognize this as a touchscreen at all. If
+	 * nothing ever opens the input device, input_dev->open() never
+	 * fires, the IRQ never gets unmasked, and the raw-data queue never
+	 * gets populated -- exactly the symptom this was chasing. */
+	input_set_capability(rm->input, EV_KEY, BTN_TOUCH);
+	input_set_abs_params(rm->input, ABS_X, 0, RM_INPUT_RESOLUTION_X - 1, 0, 0);
+	input_set_abs_params(rm->input, ABS_Y, 0, RM_INPUT_RESOLUTION_Y - 1, 0, 0);
+	input_set_capability(rm->input, EV_ABS, ABS_PRESSURE);
+	input_set_abs_params(rm->input, ABS_MT_POSITION_X, 0, RM_INPUT_RESOLUTION_X - 1, 0, 0);
+	input_set_abs_params(rm->input, ABS_MT_POSITION_Y, 0, RM_INPUT_RESOLUTION_Y - 1, 0, 0);
+	input_set_abs_params(rm->input, ABS_MT_PRESSURE, 0, 0xFF, 0, 0);
+	input_set_abs_params(rm->input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX, 0, 0);
+	ret = input_mt_init_slots(rm->input, MAX_SLOT_AMOUNT, INPUT_MT_DIRECT);
+	if (ret) {
+		dev_err_probe(dev, ret, "input_mt_init_slots failed\n");
+		goto err_wq;
+	}
+	ret = input_register_device(rm->input);
+	if (ret) {
+		dev_err_probe(dev, ret, "input_register_device failed\n");
+		goto err_wq;
+	}
+
+	rm->miscdev.minor = MISC_DYNAMIC_MINOR;
+	rm->miscdev.name = "touch";
+	rm->miscdev.fops = &rm31080_fops;
+	ret = misc_register(&rm->miscdev);
+	if (ret) {
+		dev_err_probe(dev, ret, "misc_register failed\n");
+		goto err_wq;
+	}
+
+	/* Matches add_timer(&ts_timer_triggle) at the end of
+	 * rm_tch_spi_probe(): runs unconditionally for the life of the
+	 * device, not gated on watchdog_enable (see the long NOTE on the
+	 * struct fields above). */
+	schedule_delayed_work(&rm->timer_work, HZ);
+
+	g_rm = rm;
+	dev_info(dev, "Raydium RM31080 bridge ready (platform_id=0x%02x gpio_select=0x%02x)\n",
+		 rm->platform_id, rm->gpio_select);
+	return 0;
+
+err_wq:
+	destroy_workqueue(rm->wq);
+	return ret;
+}
+
+static void rm31080_remove(struct spi_device *spi)
+{
+	struct rm31080_data *rm = spi_get_drvdata(spi);
+
+	cancel_delayed_work_sync(&rm->timer_work);
+	flush_workqueue(rm->wq);
+	destroy_workqueue(rm->wq);
+	misc_deregister(&rm->miscdev);
+	if (rm->hal_pid)
+		put_pid(rm->hal_pid);
+	if (g_rm == rm)
+		g_rm = NULL;
+}
+
+/*
+ * NOTE: suspend/resume below execute the KRL_INDEX_RM_SUSPEND /
+ * KRL_INDEX_RM_RESUME tables directly, which is the correct mechanism
+ * (this is exactly what those two table indices exist for) but the exact
+ * surrounding bookkeeping downstream's rm_ctrl_suspend()/rm_ctrl_resume()
+ * do around them (early-suspend interaction, wakelocks, IRQ
+ * enable/disable ordering) hasn't been traced function-by-function the
+ * way the rest of this driver has. Treat this PM path as the least
+ * battle-tested part of the port and watch it closely across actual
+ * suspend/resume cycles.
+ */
+static int __maybe_unused rm31080_suspend(struct device *dev)
+{
+	struct rm31080_data *rm = dev_get_drvdata(dev);
+
+	disable_irq(rm->irq);
+	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_SUSPEND]);
+	rm->is_suspended = true;
+	rm31080_send_signal(rm, RM_SIGNAL_SUSPEND);
+	return 0;
+}
+
+static int __maybe_unused rm31080_resume(struct device *dev)
+{
+	struct rm31080_data *rm = dev_get_drvdata(dev);
+
+	rm->is_suspended = false;
+	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_RESUME]);
+	enable_irq(rm->irq);
+	rm31080_send_signal(rm, RM_SIGNAL_RESUME);
+	return 0;
+}
+
+static SIMPLE_DEV_PM_OPS(rm31080_pm_ops, rm31080_suspend, rm31080_resume);
+
+static const struct of_device_id rm31080_of_match[] = {
+	{ .compatible = "raydium,rm31080" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, rm31080_of_match);
+
+static const struct spi_device_id rm31080_spi_id[] = {
+	{ "rm31080", 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, rm31080_spi_id);
+
+static struct spi_driver rm31080_spi_driver = {
+	.driver = {
+		.name = DRV_NAME,
+		.of_match_table = rm31080_of_match,
+		.pm = &rm31080_pm_ops,
+	},
+	.probe = rm31080_probe,
+	.remove = rm31080_remove,
+	.id_table = rm31080_spi_id,
+};
+module_spi_driver(rm31080_spi_driver);
+
+MODULE_AUTHOR("JordanViknar <jordanviknar@gmail.com>");
+MODULE_DESCRIPTION("Raydium RM31080 SPI touchscreen bridge (downstream-protocol-compatible)");
+MODULE_LICENSE("GPL");

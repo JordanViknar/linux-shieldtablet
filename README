@@ -1,10 +1,10 @@
-Mainline Linux for the NVIDIA SHIELD Tablet (TN8)
-=================================================
+Mainline Linux for the NVIDIA SHIELD Tablet
+===========================================
 
 This kernel is being tested exclusively on an NVIDIA SHIELD Tablet K1 with the
-NVIDIA SHIELD Android 5.0/L bootloader. It *should* work on other models, but
-not necessarily other bootloader versions. Use this kernel at your own risk,
-as it is still in a fairly experimental state.
+NVIDIA SHIELD Tablet K1's Android 5.0/L bootloader. It *should* work on other
+models, but not necessarily other bootloader versions. Use this kernel at your
+own risk, as it is still in a fairly experimental state.
 
 In other words, when using this kernel, you agree to the possibility of hardware
 damage. I've had none so far, but cannot guarantee you won't.
@@ -12,8 +12,9 @@ damage. I've had none so far, but cannot guarantee you won't.
 Android M/N bootloader compatibility is not immediately planned due to
 seemingly stricter requirements (no initramfs unless bundled in-kernel, smaller
 kernel image size). The structure to support it is in place though.
+U-Boot support is planned.
 
-This port uses `tn8_defconfig` to store its default kernel configuration.
+This port uses `shieldtablet_defconfig` to store its default kernel configuration.
 
 Note: Compile with `-march=armv7ve -mtune=cortex-a15`.
 
@@ -24,7 +25,7 @@ Fully functional:
 
 * All CPU cores
 * Internal eMMC
-* Hardware keys (volume up, volume down, power)
+* Hardware keys (volume up, volume down, power, lid switch)
 * Fuel gauge (using custom driver `lc709203f`)
 * Charger (using `bq24193`)
 * Power monitor (using `ina3221`)
@@ -35,10 +36,13 @@ Fully functional, with quirks:
 * Audio (RT5639 codec)
 * Bluetooth (using `hci_bcm`)
 * Wi-Fi (using `brcmfmac`)
+* Touchscreen (using custom driver `raydium-rm31080-spi-bridge`)
 
 Partially functional:
 
-* Display (using `tegradrm`): Instability found under high system load.
+* Display: Minor instabilities (strange coloring) found under high system load.
+  Can on rare occasion crash on startup with a screen whiteout effect, I suggest
+  quickly emergency rebooting with the power button should this happens.
 * Memory controller: Values potentially slightly off compared to downstream,
   might be the actual reason for display instability.
 * GPU (using `nouveau`): Pretty unstable, works only with a patch to Mesa :
@@ -54,15 +58,17 @@ Configured, untested :
 * Accelerometer + gyroscope (using `inv-mpu6050-i2c`)
 * Magnetometer (using `ak8975`)
 * Thermal zones
+* External microphone connected through the jack port.
+* Hardware keys (stylus pen detection)
 
 Non-functional / not worked on yet:
 
 * SD card reader
 * USB device and host
-* Touchscreen: No driver in mainline.
 * HDMI
 * GPS
 * Camera
+* Suspend
 
 Unplanned (excluding external contributions) :
 
@@ -80,6 +86,12 @@ Drivers that are unique to this kernel port and not mainlined:
 * Fuel gauge (lc709203f): Custom driver for the fuel gauge chip. Ported from
   Zephyr RTOS. Needs more testing, but seems to work fine.
   See `drivers/power/supply/lc709203f-fuel-gauge.c`
+* Touchscreen (raydium-rm31080-spi-bridge): Reproduces the /dev/touch misc-device
+  protocol that the original out-of-tree downstream Raydium kernel driver exposed,
+  so the closed-source Android userspace touch stack can be used unmodified on a
+  mainline kernel.
+  It does not decode touch data itself, and is not intended to be upstreamed.
+  See `drivers/input/touchscreen/raydium-rm31080-spi-bridge.c`.
 
 Quirks
 ------
@@ -88,13 +100,13 @@ Minor:
 
 * Audio: Userspace needs custom ALSA UCM and Wireplumber configuration to work
   properly with the tablet's audio hardware. See:
-  https://github.com/JordanViknar/linux-tn8-rootfs
+  https://github.com/JordanViknar/linux-shieldtablet-rootfs
 * Wi-Fi & Bluetooth: Requires firmware files inside initramfs. See:
-  https://github.com/JordanViknar/linux-tn8-firmware
+  https://github.com/JordanViknar/linux-shieldtablet-firmware
   Requires booting downstream kernel first, then directly restarting into
   mainline through fastboot.
 * GPU: Requires firmware files inside initramfs. See:
-  https://github.com/JordanViknar/linux-tn8-firmware
+  https://github.com/JordanViknar/linux-shieldtablet-firmware
 
 Major:
 
@@ -103,6 +115,11 @@ Major:
 * Display: Do not reboot directly from mainline into downstream kernel. It
   glitches the display and may cause hardware damage if left in this state too
   long. Rebooting from downstream into mainline is unaffected.
+* Touchscreen: Requires the closed-source downstream Android userspace
+  touch stack (`ts.default.so` / `librm31080.so`), ran with `rm-wrapper`.
+  Check my old Xubuntu 22.04 rootfs builder for a working example in its code:
+  https://github.com/JordanViknar/shieldtablet-l4t-kernel-multirom-builder
+  The current kernel driver alone produces no touch events.
 
 Implementation Notes
 --------------------
@@ -119,8 +136,8 @@ Implementation Notes
   This seems to be an upstream rt5640 UCM limitation also affecting other devices.
 * Memory controller: Couldn't get some of the downstream kernel's values to
   work on mainline. Using the values from Aaron Kling's `tegra124-ardbeg-emc.dtsi`
-  seems to be stable enough for booting and running the system.
-  See `arch/arm/boot/dts/nvidia/tegra124-tn8-emc.dtsi`.
+  seems to be stable enough for booting and running the system for now.
+  See `arch/arm/boot/dts/nvidia/tegra124-shieldtablet-emc.dtsi`.
 * SMP: On the Android L bootloader (may not be exclusive to it), PSCI CPU_ON
   claims success but never actually powers on CPU1-3. Worked around by using
   a PSCI CPU_ON call on CPU0 (already running) purely to register the reset
@@ -128,13 +145,32 @@ Implementation Notes
   PSCI, matching what the Tegra4Linux kernel does.
   See `arch/arm/mach-tegra/reset.c` and `arch/arm/mach-tegra/platsmp.c`.
 
+AI Notice
+---------
+
+This port is a prototype, and I was assisted by AI tools.
+I intend to eventually rewrite all code manually to ensure upstream-level quality.
+
+Q&A
+---
+
+* Q: Wasn't this port called "linux-tn8" ?
+  A: The NVIDIA SHIELD Tablet's official codename is "Tegra Note 8" (TN8).
+     The device tree names were based on the downstream kernel's naming scheme.
+	 However, considering :
+	 - The Xiaomi Mi Pad 1 is also a TN8 device technically speaking :
+	 https://github.com/MiCode/Xiaomi_Kernel_OpenSource/commit/79b4898e25fe3b506ff902e182b47068598c838a
+	 - Earlier revisions of the board are also referred to as TN8.
+	 - Most community projects use "shieldtablet" as codename.
+	 I have switched the kernel's codename to "shieldtablet" to avoid confusion.
+
 Credits
------------
+-------
 
 Previous mainline ports:
 
-* Alexandre Courbot, for his original basic Linux 3.17 mainline port, conveniently 
-  saved from deletion by Andrew Querol:
+* Alexandre Courbot, for his original basic Linux 3.17 mainline port,
+  conveniently saved from deletion by Andrew Querol:
   https://github.com/winsock/linux/tree/st8
 * Aaron Kling, for his more recent partial device trees for the NVIDIA SHIELD Tablet:
   https://gitlab.incom.co/CM-Shield/android_hardware_nvidia_t124_lineage/-/blob/lineage-24.0/tegra124-tn8.dts

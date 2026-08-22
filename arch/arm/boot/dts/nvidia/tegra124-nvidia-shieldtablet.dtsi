@@ -5,15 +5,13 @@
 #include <dt-bindings/thermal/thermal.h>
 #include <dt-bindings/sound/rt5640.h>
 
-/* tegra124 */
 #include "tegra124.dtsi"
-/* tn8 */
-#include "tegra124-tn8-emc.dtsi"
-#include "tegra124-tn8-pinmux.dtsi"
+#include "tegra124-nvidia-shieldtablet-emc.dtsi"
+#include "tegra124-nvidia-shieldtablet-pinmux.dtsi"
 
 / {
 	model = "NVIDIA SHIELD Tablet";
-	compatible = "nvidia,tn8", "nvidia,tegra124";
+	compatible = "nvidia,shieldtablet", "nvidia,tegra124";
 	chassis-type = "tablet";
 
 	aliases {
@@ -74,6 +72,45 @@
 		vdd-supply = <&vdd_gpu>;
 	};
 
+	spi@7000d400 {
+		status = "okay";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		touch@0 {
+			compatible = "raydium,rm31080";
+			reg = <0>;
+
+			raydium,platform-id = <0x0B>;
+			raydium,gpio-select = <0x00>;
+
+			spi-max-frequency = <18000000>;
+			nvidia,tx-clk-tap-delay = <16>;
+			nvidia,rx-clk-tap-delay = <0>;
+
+			interrupt-parent = <&gpio>;
+			interrupts = <TEGRA_GPIO(K, 2) IRQ_TYPE_EDGE_RISING>;
+
+			/*
+			 * Downstream drives this pin low-then-high with the raw
+			 * (non-gpiod, flag-ignoring) legacy GPIO API to reset the
+			 * controller, i.e. low = held in reset, high = running.
+			 * That is an active-low reset line.
+			 */
+			reset-gpios = <&gpio TEGRA_GPIO(K, 4) GPIO_ACTIVE_LOW>;
+
+			clocks = <&tegra_car TEGRA124_CLK_EXTERN2>;
+			clock-names = "extern2";
+			assigned-clocks = <&tegra_car TEGRA124_CLK_EXTERN2>;
+			assigned-clock-parents = <&tegra_car TEGRA124_CLK_PLL_P>;
+			assigned-clock-rates = <40800000>;
+
+			avdd-supply = <&avdd_ts_3v3>;
+			dvdd-supply = <&vdd_ts_1v8>;
+		};
+	};
+
 	// UNKNOWN
 	uarta: serial@70006000 {
 		status = "okay";
@@ -101,7 +138,7 @@
 			Will only function from a restart from downstream kernel for now.
 			
 			Note :
-			- Copy /system/etc/firmware/bcm43241.hcd into /lib/firmware/brcm/BCM4334B0.nvidia,tn8.hcd in initramfs.
+			- Copy /system/etc/firmware/bcm43241.hcd into /lib/firmware/brcm/BCM4334B0.nvidia,shieldtablet.hcd in initramfs.
 		*/
 		bluetooth {
 			compatible = "brcm,bcm43241b0-bt", "brcm,bcm4334-bt"; // CONFIG_BT_HCIUART_BCM
@@ -585,7 +622,7 @@
 			Will only function from a restart from downstream kernel for now.
 			
 			Note :
-			- Copy `/system/vendor/firmware/bcm43241/fw_bcmdhd.bin` into `/lib/firmware/brcm/brcmfmac43241b0-sdio.nvidia,tn8.bin` in initramfs.
+			- Copy `/system/vendor/firmware/bcm43241/fw_bcmdhd.bin` into `/lib/firmware/brcm/brcmfmac43241b0-sdio.nvidia,shieldtablet.bin` in initramfs.
 			- Copy `/data/misc/wifi/firmware/nvram.txt` into `/lib/firmware/brcm/brcmfmac43241b0-sdio.txt` in initramfs.
 			- clm_blob currently missing. Optional.
 		*/
@@ -772,7 +809,7 @@
 		regulator-max-microvolt = <3300000>;
 		gpio = <&palmas_gpio 2 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
-		vin-supply = <&ldo3_reg>;
+		vin-supply = <&ldo3_reg>; // downstream runtime reports it's backed by ldo3_reg/vdd-touch, downstream DTS says it's ldousb/avdd-usb ?
 	};
 
 	sound {
