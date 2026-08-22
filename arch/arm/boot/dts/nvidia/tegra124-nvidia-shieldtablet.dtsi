@@ -50,7 +50,7 @@
 
 	// UNFINISHED
 	host1x@50000000 {
-		dsi@54300000 {
+		dsi: dsi@54300000 {
 			status = "okay";
 
 			avdd-dsi-csi-supply = <&ldo5_reg>;

@@ -18,6 +18,15 @@
 	chosen {
 		linux,initrd-start = <0x81680000>;
 		linux,initrd-end = <0x82800000>;
+
+		framebuffer@ad012000 {
+			compatible = "simple-framebuffer";
+			memory-region = <&bootloader_fb>;
+			width = <1200>;
+			height = <1920>;
+			stride = <(1216 * 4)>;
+			format = "a8b8g8r8";
+		};
 	};
 
 	// --- Memory ---

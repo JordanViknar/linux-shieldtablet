@@ -29,7 +29,8 @@ Fully functional:
 * Fuel gauge (using custom driver `lc709203f`)
 * Charger (using `bq24193`)
 * Power monitor (using `ina3221`)
-* Thermal sensors (using `tegra_soctherm` and `generic_adc_thermal`)
+* Thermal sensors (using `tegra_soctherm` & `generic_adc_thermal`)
+* DRM (`tegradrm` & `simpledrm`)
 
 Fully functional, with quirks:
 
@@ -58,7 +59,7 @@ Configured, untested :
 * Accelerometer + gyroscope (using `inv-mpu6050-i2c`)
 * Magnetometer (using `ak8975`)
 * Thermal zones
-* External microphone connected through the jack port.
+* External microphone connected through jack
 * Hardware keys (stylus pen detection)
 
 Non-functional / not worked on yet:
@@ -148,7 +149,7 @@ Implementation Notes
 AI Notice
 ---------
 
-This port is a prototype, and I was assisted by AI tools.
+This port is a prototype, and I was helped by AI tools for the C code and research.
 I intend to eventually rewrite all code manually to ensure upstream-level quality.
 
 Q&A
