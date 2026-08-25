@@ -277,10 +277,10 @@ struct rm_tch_ctrl_para {
  * rm_tch_read_image_data() in the L4T-forked driver. Confirmed needed:
  * userspace's RM_IOCTL_READ_RAW_DATA request length is
  * ctrl.u16_data_length + QUEUE_HEADER_NUM exactly (observed 0x1228 = 4648
- * requested vs. 4640 reported data_length -- an 8-byte gap). We don't
- * implement frequency hopping itself (see the KRL_CMD_SET_TIMER NOTE
- * elsewhere), so the noise-scan-channel byte always reports 0, matching
- * downstream's own fallback when u8_ns_func_enable is off.
+ * requested vs. 4640 reported data_length -- an 8-byte gap). The
+ * noise-scan-channel byte (offset 3) reflects the actually-selected
+ * channel when frequency hopping is enabled -- see the ns_* fields on
+ * struct rm31080_data and rm31080_ctrl_scan_start().
  */
 #define QUEUE_HEADER_NUM	8
 #define SCAN_TYPE_MT		1
@@ -372,6 +372,46 @@ struct rm31080_data {
 	u32 watchdog_time;			/* g_st_ts.u32_watch_dog_time, in
 						 * post-downsampling ticks; arg>>16
 						 * from SET_VARIABLE(WATCHDOG_FLAG) */
+
+	/*
+	 * Frequency hopping / noise-scan channel cycling. Ported from
+	 * rm_tch_ctrl_scan_start()'s ENABLE_FREQ_HOPPING branch,
+	 * rm_set_ns_para(), rm_set_repeat_times(), and
+	 * rm_tch_ctrl_wait_for_scan_finish() in rm31080a_ts.c. Unlike
+	 * idle/auto-scan mode, this is NOT dead code: ctrl.u8_ns_func_enable
+	 * is derived from bits 6-7 of SET_VARIABLE(WATCHDOG_FLAG)'s low byte
+	 * (see rm31080_watchdog_configure()), and confirmed live on real
+	 * hardware (arg=0x140041, captured repeatedly, decodes to
+	 * ns_func_enable=1). When enabled, every scan_start cycles through a
+	 * table of up to 3 noise-scan parameter columns instead of just
+	 * running the plain SCANSTART table.
+	 */
+	u8 ns_para[9];		/* g_st_ts.u8_ns_para: 3 columns x 3 bytes,
+				 * set via RM_VARIABLE_DPW (a user pointer,
+				 * not a scalar -- see rm31080_set_variable()) */
+	u8 ns_mode;		/* g_st_ts.u8_ns_mode: highest valid column
+				 * index, via RM_VARIABLE_NS_MODE */
+	u8 ns_rpt;		/* g_st_ts.u8_ns_rpt: repeat count for ns mode,
+				 * via RM_VARIABLE_REPEAT */
+	u8 ns_sel;		/* g_st_ts.u8_ns_sel: currently selected
+				 * column's value, echoed into the raw-scan
+				 * header's noise-scan-channel byte */
+	u8 ns_sel_idx;		/* static u8NsSel in rm_tch_ctrl_scan_start():
+				 * which column we're on, 0..ns_mode */
+	u8 ns_last_rpt;		/* static u8Rpt in rm_tch_ctrl_scan_start();
+				 * downstream initialises this to 1, not 0 --
+				 * see probe() */
+	struct mutex ns_mode_lock;	/* g_st_ts.mutex_ns_mode */
+
+	u8 repeat_counter;	/* ts->u8_repeat_counter: scratch value
+				 * KRL_CMD_WRITE_W_COUNT ORs into the byte it
+				 * writes. Only meaningful for KRL table calls
+				 * made on behalf of the noise-scan/repeat-time
+				 * machinery below -- clear_int/scan_start's own
+				 * base table and read_image never touch it. */
+	u16 read_para;		/* g_st_ts.u16_read_para: written by
+				 * KRL_CMD_RETURN_RESULT/RETURN_VALUE, read by
+				 * rm31080_wait_for_scan_finish(). */
 };
 
 /* Only one touch chip in the system; the KRL interpreter and a couple of
@@ -398,6 +438,8 @@ static int rm31080_spi_read(struct rm31080_data *rm, u8 addr, u8 *rxbuf, size_t 
 	int ret;
 
 	if (rm->spi_locked) {
+		dev_dbg_ratelimited(&rm->spi->dev,
+			"spi_read(addr=0x%02x len=%zu) skipped: spi_locked\n", addr, len);
 		memset(rxbuf, 0, len);
 		return RETURN_OK;
 	}
@@ -422,8 +464,10 @@ static int rm31080_spi_write(struct rm31080_data *rm, u8 *txbuf, size_t len)
 {
 	int ret;
 
-	if (rm->spi_locked)
+	if (rm->spi_locked) {
+		dev_dbg_ratelimited(&rm->spi->dev, "spi_write(len=%zu) skipped: spi_locked\n", len);
 		return RETURN_OK;
+	}
 
 	ret = spi_write(rm->spi, txbuf, len);
 	if (ret) {
@@ -736,17 +780,14 @@ static int rm31080_cmd_process(struct rm31080_data *rm, u8 sel_case, u8 *tbl)
 			ret = RETURN_OK;
 			break;
 		case KRL_CMD_WRITE_W_COUNT:
-			/* NOTE: downstream ORs in a repeat-counter maintained
-			 * by rm_set_repeat_times()/RM_IOCTL_SET_VARIABLE
-			 * (RM_VARIABLE_REPEAT). Repeat-counter state isn't
-			 * tracked in this port yet; falls back to writing
-			 * the scratch register unmodified. */
-			ret = rm31080_spi_byte_write(rm, p_addr, reg);
+			ret = rm31080_spi_byte_write(rm, p_addr, reg | rm->repeat_counter);
 			break;
 		case KRL_CMD_RETURN_RESULT:
+			rm->read_para = reg;
 			ret = RETURN_OK;
 			break;
 		case KRL_CMD_RETURN_VALUE:
+			rm->read_para = ((u16)p_addr << 8) | p_data;
 			ret = RETURN_OK;
 			break;
 		case KRL_CMD_CONFIG_IRQ:
@@ -784,8 +825,7 @@ static int rm31080_read_image(struct rm31080_data *rm, u8 *dest, size_t data_len
 	dest[0] = SCAN_TYPE_MT;
 	dest[1] = (u8)(data_len >> 8);
 	dest[2] = (u8)data_len;
-	dest[3] = 0;	/* noise-scan channel select; 0 since we don't implement
-			 * frequency hopping (u8_ns_func_enable always "off") */
+	dest[3] = (rm->ctrl.u8_ns_func_enable & 0x01) ? rm->ns_sel : 0;
 	dest[4] = 0;	/* self-test mode type; 0 (RM_TEST_MODE_NULL) since we
 			 * don't implement the self-test ioctls */
 	dest[5] = 0;
@@ -958,6 +998,91 @@ static void rm31080_report_pointer(struct rm31080_data *rm, struct rm_touch_even
 }
 
 /* =========================================================================
+ * Frequency hopping / noise-scan channel cycling
+ *
+ * Ported from rm_set_repeat_times(), rm_set_ns_para(),
+ * rm_tch_ctrl_wait_for_scan_finish(), and rm_tch_ctrl_scan_start()'s
+ * ENABLE_FREQ_HOPPING branch in rm31080a_ts.c. See the NOTE on the ns_*
+ * struct fields above for why this -- unlike idle/auto-scan mode -- is not
+ * dead code and needed real implementation.
+ * ========================================================================= */
+
+static void rm31080_set_repeat_times(struct rm31080_data *rm, u8 times)
+{
+	if (times <= 1)
+		times = 0;
+	else
+		times -= 1;
+	if (times > 127)
+		times = 127;
+
+	rm->repeat_counter = times & 0x7F;
+	rm31080_cmd_process(rm, times == 0 ? 0 : 1, rm->krl_tbl[KRL_INDEX_RM_SETREPTIME]);
+}
+
+static void rm31080_set_ns_para(struct rm31080_data *rm, u8 col)
+{
+	u8 *tbl = rm->krl_tbl[KRL_INDEX_RM_NSPARA];
+	u8 case_count = tbl[KRL_TBL_FIELD_POS_CASE_NUM];
+	int ii;
+
+	for (ii = 0; ii < case_count; ii++) {
+		rm->repeat_counter = rm->ns_para[ii * 3 + col];
+		rm31080_cmd_process(rm, ii, tbl);
+	}
+}
+
+/*
+ * rm_tch_ctrl_wait_for_scan_finish(1) downstream always executes the
+ * WAITSCANOK table exactly once and returns 0 unconditionally for our
+ * caller (u8Idx=1): the loop either breaks immediately (scan already done)
+ * or returns immediately on the first "still busy" check (u8Idx truthy
+ * skips the retry-sleep branch entirely) -- so its 50-iteration polling
+ * loop is unreachable beyond the first pass in this call pattern. We only
+ * need the one side-effecting table execution; the result is genuinely
+ * unused by the only caller we have (rm31080_ctrl_scan_start()).
+ */
+static void rm31080_wait_for_scan_finish(struct rm31080_data *rm)
+{
+	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_WAITSCANOK]);
+}
+
+/*
+ * rm_tch_ctrl_scan_start(): replaces the bare SCANSTART call when
+ * frequency hopping is enabled. Note the exact ordering downstream uses,
+ * preserved here rather than "simplified": ns_sel is latched from the
+ * *current* column before advancing the index, but rm31080_set_ns_para()
+ * is then called with the *already-advanced* index -- these are not the
+ * same value, and that appears intentional (matches specific chip-side
+ * pipelining), not a bug to fix.
+ */
+static int rm31080_ctrl_scan_start(struct rm31080_data *rm)
+{
+	if (rm->ctrl.u8_ns_func_enable & 0x01) {
+		rm31080_wait_for_scan_finish(rm);
+
+		mutex_lock(&rm->ns_mode_lock);
+		rm->ns_sel = rm->ns_para[rm->ns_sel_idx];
+		if (rm->ns_sel_idx < rm->ns_mode)
+			rm->ns_sel_idx++;
+		else
+			rm->ns_sel_idx = 0;
+
+		if (rm->ns_last_rpt != rm->ns_rpt) {
+			rm->ns_last_rpt = rm->ns_rpt;
+			rm31080_set_repeat_times(rm, rm->ns_last_rpt);
+		}
+		rm31080_set_ns_para(rm, rm->ns_sel_idx);
+		mutex_unlock(&rm->ns_mode_lock);
+	} else {
+		rm->ns_sel_idx = 0;
+		rm->ns_sel = 0;
+	}
+
+	return rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_SCANSTART]);
+}
+
+/* =========================================================================
  * IRQ handling
  *
  * Ported from rm_tch_irq() + rm_work_handler() in rm31080a_ts.c, collapsed
@@ -980,7 +1105,7 @@ static void rm31080_irq_work(struct work_struct *work)
 	}
 
 	clear_ret = rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_CLEARINT]);
-	scan_ret = rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_SCANSTART]);
+	scan_ret = rm31080_ctrl_scan_start(rm);
 
 	mutex_lock(&rm->q_lock);
 	slot = rm31080_q_enqueue_start(rm);
@@ -1143,9 +1268,17 @@ static void rm31080_watchdog_configure(struct rm31080_data *rm, unsigned long ar
 		rm->watchdog_time = 0xFFFFFFFF;
 	}
 
+	/* Same packed arg also carries u8_ns_func_enable in bits 6-7 of its
+	 * low byte downstream (g_st_ctrl.u8_ns_func_enable is a single
+	 * variable also written wholesale by RM_IOCTL_SET_PARAMETER; this is
+	 * the second, later writer -- confirmed live on real hardware via
+	 * arg=0x140041 decoding to ns_func_enable=1). */
+	rm->ctrl.u8_ns_func_enable = (u8)(arg & 0xFF) >> 6;
+
 	dev_dbg(&rm->spi->dev,
-		"watchdog: configured via SET_VARIABLE, arg=0x%lx -> enable=%d period=%u (timer_trigger_scale=%u)\n",
-		arg, rm->watchdog_enable, rm->watchdog_time, rm->ctrl.u8_timer_trigger_scale);
+		"watchdog: configured via SET_VARIABLE, arg=0x%lx -> enable=%d period=%u ns_func_enable=%u (timer_trigger_scale=%u)\n",
+		arg, rm->watchdog_enable, rm->watchdog_time, rm->ctrl.u8_ns_func_enable,
+		rm->ctrl.u8_timer_trigger_scale);
 }
 
 /* =========================================================================
@@ -1264,21 +1397,51 @@ static void rm31080_set_variable(struct rm31080_data *rm, unsigned int index, un
 	case RM_VARIABLE_SET_SPI_UNLOCK:
 		rm->spi_locked = false;
 		break;
+	case RM_VARIABLE_REPEAT:
+		/* downstream also stores this into a general-purpose
+		 * g_st_ts.u8_repeat with no other consumer we've found in
+		 * any of the three driver versions checked; only the
+		 * noise-scan-specific half (u8_ns_rpt, consulted by
+		 * rm31080_ctrl_scan_start()) is tracked here. */
+		rm->ns_rpt = (u8)arg;
+		dev_dbg(&rm->spi->dev, "SET_VARIABLE(REPEAT): ns_rpt=%u\n", rm->ns_rpt);
+		break;
+	case RM_VARIABLE_DPW:
+		/* Unlike every other SET_VARIABLE case, arg here is a user
+		 * pointer to a 9-byte buffer (3 noise-scan columns x 3
+		 * bytes), not a packed scalar -- ported from
+		 * copy_from_user(&g_st_ts.u8_ns_para[0], (u8 *)arg, 9). */
+		mutex_lock(&rm->ns_mode_lock);
+		if (copy_from_user(rm->ns_para, (void __user *)(uintptr_t)arg,
+				    sizeof(rm->ns_para)))
+			dev_warn(&rm->spi->dev, "RM_VARIABLE_DPW: copy_from_user failed\n");
+		else
+			dev_dbg(&rm->spi->dev,
+				"SET_VARIABLE(DPW): ns_para=[%u,%u,%u,%u,%u,%u,%u,%u,%u]\n",
+				rm->ns_para[0], rm->ns_para[1], rm->ns_para[2],
+				rm->ns_para[3], rm->ns_para[4], rm->ns_para[5],
+				rm->ns_para[6], rm->ns_para[7], rm->ns_para[8]);
+		mutex_unlock(&rm->ns_mode_lock);
+		break;
+	case RM_VARIABLE_NS_MODE:
+		mutex_lock(&rm->ns_mode_lock);
+		rm->ns_mode = (u8)arg;
+		mutex_unlock(&rm->ns_mode_lock);
+		dev_dbg(&rm->spi->dev, "SET_VARIABLE(NS_MODE): ns_mode=%u\n", rm->ns_mode);
+		break;
 	case RM_VARIABLE_VERSION:
 	case RM_VARIABLE_TEST_VERSION:
 	case RM_VARIABLE_SELF_TEST_RESULT:
 	case RM_VARIABLE_SCRIBER_FLAG:
 	case RM_VARIABLE_IDLEMODECHECK:
-	case RM_VARIABLE_REPEAT:
 	case RM_VARIABLE_SET_WAKE_UNLOCK:
 	case RM_VARIABLE_TOUCHFILE_STATUS:
 	case RM_VARIABLE_TOUCH_EVENT:
 	default:
 		/* NOTE: these are diagnostic/self-test/uevent hooks in
 		 * downstream (rm_tch_enter_test_mode(),
-		 * rm_tch_generate_event(), frequency-hopping params, ...)
-		 * that don't affect the basic touch data path. Accepted
-		 * and otherwise ignored for now. */
+		 * rm_tch_generate_event(), ...) that don't affect the basic
+		 * touch data path. Accepted and otherwise ignored for now. */
 		break;
 	}
 }
@@ -1473,6 +1636,8 @@ static int rm31080_probe(struct spi_device *spi)
 	spi_set_drvdata(spi, rm);
 	mutex_init(&rm->krl_lock);
 	mutex_init(&rm->q_lock);
+	mutex_init(&rm->ns_mode_lock);
+	rm->ns_last_rpt = 1;	/* matches downstream's static u8Rpt = 1 */
 	INIT_WORK(&rm->irq_work, rm31080_irq_work);
 	INIT_DELAYED_WORK(&rm->timer_work, rm31080_timer_work);
 
