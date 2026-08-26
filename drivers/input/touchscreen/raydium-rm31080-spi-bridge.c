@@ -1714,10 +1714,28 @@ static void rm31080_set_variable(struct rm31080_data *rm, unsigned int index, un
 		mutex_unlock(&rm->ns_mode_lock);
 		break;
 	case RM_VARIABLE_NS_MODE:
+		/*
+		 * NOT bounds-checked downstream either (g_st_ts.u8_ns_mode =
+		 * (u8)arg; verbatim, no clamp) -- this is a faithfully-ported
+		 * gap being closed, not a new one. ns_mode is the wrap
+		 * boundary for ns_sel_idx in rm31080_ctrl_scan_start(), which
+		 * directly indexes the 9-byte ns_para[] (3 columns x 3 bytes
+		 * -- see the NOTE on ns_para above). Any arg > 2 here would
+		 * let ns_sel_idx climb past column 2 and read out of bounds
+		 * on every following scan_start, via both
+		 * rm->ns_para[rm->ns_sel_idx] directly and
+		 * rm31080_set_ns_para()'s ns_para[ii * 3 + col]. The HAL is
+		 * closed-source and this ioctl is reachable by anything with
+		 * access to /dev/touch, so clamp rather than trust it -- a
+		 * conforming caller only ever sends 0-2 anyway (matches what
+		 * we've observed live: ns_mode=1), so this changes nothing
+		 * for valid input.
+		 */
 		mutex_lock(&rm->ns_mode_lock);
-		rm->ns_mode = (u8)arg;
+		rm->ns_mode = min_t(u8, (u8)arg, 2);
 		mutex_unlock(&rm->ns_mode_lock);
-		dev_dbg(&rm->spi->dev, "SET_VARIABLE(NS_MODE): ns_mode=%u\n", rm->ns_mode);
+		dev_dbg(&rm->spi->dev, "SET_VARIABLE(NS_MODE): ns_mode=%u (requested %lu)\n",
+			rm->ns_mode, arg);
 		break;
 	case RM_VARIABLE_VERSION:
 	case RM_VARIABLE_TEST_VERSION:
