@@ -62,6 +62,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
@@ -82,6 +83,17 @@
 #include <linux/input/mt.h>
 #include <linux/pm.h>
 
+/*
+ * MSC_ACTIVITY isn't in mainline uapi/linux/input.h (it stops at
+ * MSC_TIMESTAMP/MSC_MAX=0x06); downstream's Android-common-kernel-derived
+ * uapi/linux/input.h adds MSC_TIMESEC, MSC_TIMEUSEC, and this at 0x08.
+ * Defined locally rather than depending on kernel headers we don't
+ * control, matching the confirmed downstream value exactly.
+ */
+#ifndef MSC_ACTIVITY
+#define MSC_ACTIVITY			0x08
+#endif
+
 #define DRV_NAME "raydium-rm31080-spi-bridge"
 
 /* =========================================================================
@@ -99,6 +111,17 @@
 #define RM_SIGNAL_CHANGE_PARA		0x00000004
 #define RM_SIGNAL_WATCH_DOG_CHECK	0x00000005
 #define RM_SIGNAL_REPORT_MODE_CHANGE	0x00000006
+
+/* scan_mode_state values, ported from rm31080a_ts.c */
+#define RM_SCAN_ACTIVE_MODE		0x00
+#define RM_SCAN_PRE_IDLE_MODE		0x01
+#define RM_SCAN_IDLE_MODE		0x02
+
+/* rm31080_ctrl_configure() return flags, ported from rm31080a_ts.c */
+#define RM_NEED_NONE			0x00
+#define RM_NEED_TO_SEND_SCAN		0x01
+#define RM_NEED_TO_READ_RAW_DATA	0x02
+#define RM_NEED_TO_SEND_SIGNAL		0x04
 
 #define RM_IOCTL_REPORT_POINT		0x1001
 #define RM_IOCTL_SET_HAL_PID		0x1002
@@ -292,6 +315,24 @@ struct rm_tch_ctrl_para {
 struct rm31080_data {
 	struct spi_device *spi;
 	struct miscdevice miscdev;
+	/*
+	 * NOT a downstream field -- deliberate hardening beyond faithful
+	 * parity. Downstream's dev_release() (and our original port of it)
+	 * unconditionally clears b_init_finish/init_finished and force-exits
+	 * idle mode on ANY close() of ANY fd, because there's a single
+	 * global driver instance shared by every opener. Downstream gets
+	 * away with this because nothing but the HAL is ever expected to
+	 * touch the device node. That assumption doesn't hold once anything
+	 * else (a debug tool, a udev rule, a stray `stat`-then-open from
+	 * some unrelated userspace helper) opens and closes it while the
+	 * HAL's own long-lived session is still active: that incidental
+	 * close silently kills live touch reporting until the HAL restarts
+	 * -- observed directly during AUTOSCAN_FLAG testing. This refcount
+	 * makes rm31080_release()'s reset logic only run on the LAST close,
+	 * which is what downstream's design clearly intends even though its
+	 * code doesn't enforce it.
+	 */
+	atomic_t open_count;
 	struct input_dev *input;
 
 	struct gpio_desc *gpio_reset;
@@ -336,15 +377,42 @@ struct rm31080_data {
 	bool spi_locked;
 	u8 last_touch_count;
 
-	/* NOTE: downstream's u8_scan_mode_state state machine
-	 * (ACTIVE/PRE_IDLE/IDLE) is a power-saving optimisation that lets
-	 * the chip free-run without an IRQ round trip per sample. This port
-	 * always behaves as if in RM_SCAN_ACTIVE_MODE: every IRQ does
-	 * clear-int + scan-start + read-image + signal. This is functionally
-	 * correct (same data path the userspace HAL already exercises,
-	 * downstream's own default mode) but skips the idle/auto-scan power
-	 * optimisation. Revisit if standby power draw with the screen on
-	 * but idle turns out to matter. */
+	/*
+	 * downstream's u8_scan_mode_state state machine (ACTIVE/PRE_IDLE/
+	 * IDLE), ported from rm_tch_ctrl_configure() / _enter_auto_mode() /
+	 * _leave_auto_mode() in rm31080a_ts.c. Confirmed live on real
+	 * hardware -- NOT dead code: librm31080.so calls
+	 * SET_VARIABLE(AUTOSCAN_FLAG, 1) once its no-touch idle counter
+	 * crosses a configured threshold (raydium_spi_ioctl(0x31010, 1),
+	 * decompiled right next to a "HAL sent enter auto scan mode" log
+	 * string). RM_IOCTL_SET_VARIABLE's index<<16 packing puts that at
+	 * RM_VARIABLE_AUTOSCAN_FLAG (0x03) on RM_IOCTL_SET_VARIABLE
+	 * (0x1010): (0x03 << 16) | 0x1010 == 0x31010.
+	 *
+	 * PRE_IDLE_MODE and IDLE_MODE are entirely driven from
+	 * rm31080_ctrl_configure(), called once per IRQ from
+	 * rm31080_irq_work(): PRE_IDLE runs the enter-auto-mode sequence
+	 * and skips that cycle's scan/read/signal (the chip free-runs the
+	 * idle KRL table on its own from here); IDLE runs the
+	 * leave-auto-mode sequence and resumes normal scanning the cycle
+	 * after. There is deliberately no path back to PRE_IDLE from
+	 * userspace calling AUTOSCAN_FLAG a second time while already
+	 * idle -- downstream's switch case only fires the PRE_IDLE
+	 * transition from ACTIVE_MODE, matching that exactly.
+	 *
+	 * rm31080_ctrl_enter_manual_mode() (downstream:
+	 * rm_tch_enter_manual_mode()) force-exits idle mode from
+	 * rm31080_release() and RM_IOCTL_INIT_START -- see those sites.
+	 *
+	 * KNOWN GAP, not ported: raydium_tlk_ns_touch_suspend(), downstream's
+	 * third caller of rm_tch_enter_manual_mode(), gated behind
+	 * CONFIG_TRUSTED_LITTLE_KERNEL (which the Shield Tablet defconfig
+	 * does enable) and EXPORT_SYMBOL'd for some other TrustZone-side
+	 * kernel module to call into. We have no visibility into what calls
+	 * it or when, so it's left unimplemented rather than guessed at.
+	 */
+	u8 scan_mode_state;		/* g_st_ts.u8_scan_mode_state */
+	struct mutex scan_mode_lock;	/* g_st_ts.mutex_scan_mode */
 
 	/*
 	 * Ported from ts_timer_triggle/ts_timer_triggle_function +
@@ -372,6 +440,16 @@ struct rm31080_data {
 	u32 watchdog_time;			/* g_st_ts.u32_watch_dog_time, in
 						 * post-downsampling ticks; arg>>16
 						 * from SET_VARIABLE(WATCHDOG_FLAG) */
+	bool watchdog_check;			/* g_st_ts.b_watch_dog_check: set by
+						 * the timer tick when the watchdog
+						 * period elapses while
+						 * scan_mode_state != ACTIVE_MODE;
+						 * defers the actual watchdog table
+						 * run to userspace via
+						 * RM_SIGNAL_WATCH_DOG_CHECK instead
+						 * of running it directly, since the
+						 * idle KRL table owns the SPI bus
+						 * autonomously while idle */
 
 	/*
 	 * Frequency hopping / noise-scan channel cycling. Ported from
@@ -762,9 +840,11 @@ static int rm31080_cmd_process(struct rm31080_data *rm, u8 sel_case, u8 *tbl)
 			break;
 		case KRL_CMD_SET_TIMER:
 			/* NOTE: downstream's slow-scan re-arm timer
-			 * (init/add/del) is part of the idle/auto-scan power
-			 * path we're not implementing yet (see the NOTE on
-			 * scan_mode_state above); accept and no-op. */
+			 * (init/add/del) belongs to ENABLE_SLOW_SCAN, a
+			 * separate progressive-scan-rate feature from the
+			 * PRE_IDLE/IDLE auto-scan mode (see the NOTE on
+			 * scan_mode_state above, which IS implemented) --
+			 * slow-scan itself isn't wired up; accept and no-op. */
 			ret = RETURN_OK;
 			break;
 		case KRL_CMD_MSLEEP: {
@@ -924,6 +1004,10 @@ static void rm31080_report_pointer(struct rm31080_data *rm, struct rm_touch_even
 
 	count = max(rm->last_touch_count, tp->uc_touch_count);
 
+	dev_dbg_ratelimited(&rm->spi->dev,
+		"report_pointer: last_touch_count=%u uc_touch_count=%u count=%d\n",
+		rm->last_touch_count, tp->uc_touch_count, count);
+
 	if (count && !tp->uc_touch_count) {
 		rm->last_touch_count = 0;
 		for (i = 0; i < MAX_SLOT_AMOUNT; i++) {
@@ -1082,20 +1166,143 @@ static int rm31080_ctrl_scan_start(struct rm31080_data *rm)
 	return rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_SCANSTART]);
 }
 
+/*
+ * rm_tch_ctrl_enter_auto_mode(): hand scanning over to the chip's
+ * autonomous idle KRL table. Ported directly, including the ordering
+ * (baseline flush, then repeat-times, then the table itself).
+ *
+ * The baseline write here is unconditional on purpose: downstream gates
+ * it on a separate b_bl_updated flag before calling rm_tch_write_image_data(),
+ * but that flag and our baseline_pending serve the exact same "has a new
+ * baseline been staged" role, and KRL_CMD_WRITE_IMG (see rm31080_cmd_process())
+ * already no-ops successfully when baseline_pending is false -- so checking
+ * it twice would be redundant, not more correct.
+ */
+static void rm31080_ctrl_enter_auto_mode(struct rm31080_data *rm)
+{
+	rm->ctrl.u8_idle_mode_check &= ~0x01;
+
+	dev_dbg(&rm->spi->dev, "scan_mode: entering auto (idle) scan mode\n");
+
+	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_WRITE_IMG]);
+	rm31080_set_repeat_times(rm, rm->ctrl.u8_idle_digital_repeat_times);
+	rm31080_cmd_process(rm, 1, rm->krl_tbl[KRL_INDEX_FUNC_SET_IDLE]);
+}
+
+/*
+ * rm_tch_ctrl_leave_auto_mode(): pull scanning back under IRQ control.
+ * The ns_para column reset to 0 here is deliberate and downstream-exact:
+ * leaving idle mode always restarts frequency hopping (if enabled) from
+ * column 0, regardless of which column ns_sel_idx was sitting on when
+ * AUTOSCAN_FLAG put us into idle mode.
+ */
+static void rm31080_ctrl_leave_auto_mode(struct rm31080_data *rm)
+{
+	rm->ctrl.u8_idle_mode_check |= 0x01;
+
+	if (rm->ctrl.u8_ns_func_enable & 0x01) {
+		mutex_lock(&rm->ns_mode_lock);
+		rm31080_set_ns_para(rm, 0);
+		mutex_unlock(&rm->ns_mode_lock);
+	}
+
+	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_FUNC_SET_IDLE]);
+	rm31080_set_repeat_times(rm, rm->ctrl.u8_active_digital_repeat_times);
+
+	dev_dbg(&rm->spi->dev, "scan_mode: left auto (idle) scan mode\n");
+}
+
+/*
+ * rm_tch_enter_manual_mode(): force scan_mode_state back to ACTIVE_MODE
+ * outright, used wherever downstream needs guaranteed IRQ-driven scanning
+ * before doing something else (closing the device node, restarting init)
+ * rather than waiting for the next IRQ to naturally pump the PRE_IDLE ->
+ * IDLE -> ACTIVE cycle. The flush_workqueue() must run with scan_mode_lock
+ * NOT held -- it drains rm31080_irq_work(), which takes that same lock via
+ * rm31080_ctrl_configure() -- so this must never itself be called from
+ * inside rm31080_irq_work().
+ */
+static void rm31080_ctrl_enter_manual_mode(struct rm31080_data *rm)
+{
+	flush_workqueue(rm->wq);
+
+	mutex_lock(&rm->scan_mode_lock);
+	switch (rm->scan_mode_state) {
+	case RM_SCAN_PRE_IDLE_MODE:
+		rm->scan_mode_state = RM_SCAN_ACTIVE_MODE;
+		mutex_unlock(&rm->scan_mode_lock);
+		return;
+	case RM_SCAN_IDLE_MODE:
+		rm31080_ctrl_leave_auto_mode(rm);
+		rm->scan_mode_state = RM_SCAN_ACTIVE_MODE;
+		mutex_unlock(&rm->scan_mode_lock);
+		/* Downstream's msleep(10)-equivalent settling time after a
+		 * manually-forced (i.e. not IRQ-cycle-paced) mode exit. */
+		usleep_range(10000, 10050);
+		return;
+	default:
+		mutex_unlock(&rm->scan_mode_lock);
+		return;
+	}
+}
+
+/*
+ * rm_tch_ctrl_configure(): called once per IRQ (after clear-int, before
+ * scan-start) to decide what this cycle needs to do. ACTIVE_MODE is the
+ * steady state and is what every cycle did before this state machine
+ * existed. PRE_IDLE/IDLE are one-shot transitions requested by
+ * SET_VARIABLE(AUTOSCAN_FLAG) (see rm31080_set_variable()) and by this
+ * function itself advancing PRE_IDLE -> IDLE -> (next AUTOSCAN_FLAG call
+ * or chip activity) -> ACTIVE.
+ */
+static u32 rm31080_ctrl_configure(struct rm31080_data *rm)
+{
+	u32 flag;
+
+	mutex_lock(&rm->scan_mode_lock);
+	switch (rm->scan_mode_state) {
+	case RM_SCAN_ACTIVE_MODE:
+		flag = RM_NEED_TO_SEND_SCAN | RM_NEED_TO_READ_RAW_DATA |
+		       RM_NEED_TO_SEND_SIGNAL;
+		break;
+	case RM_SCAN_PRE_IDLE_MODE:
+		rm31080_ctrl_enter_auto_mode(rm);
+		rm->scan_mode_state = RM_SCAN_IDLE_MODE;
+		flag = RM_NEED_NONE;
+		break;
+	case RM_SCAN_IDLE_MODE:
+		rm31080_ctrl_leave_auto_mode(rm);
+		rm->scan_mode_state = RM_SCAN_ACTIVE_MODE;
+		flag = RM_NEED_TO_SEND_SCAN;
+		break;
+	default:
+		flag = RM_NEED_NONE;
+		break;
+	}
+	mutex_unlock(&rm->scan_mode_lock);
+
+	return flag;
+}
+
 /* =========================================================================
  * IRQ handling
  *
- * Ported from rm_tch_irq() + rm_work_handler() in rm31080a_ts.c, collapsed
- * to the RM_SCAN_ACTIVE_MODE path (see the NOTE on scan_mode_state above):
- * every touch IRQ does clear-int, scan-start, pulls one scan image into
- * the ring buffer, then signals the HAL.
+ * Ported from rm_tch_irq() + rm_work_handler() in rm31080a_ts.c. Clear-int
+ * runs unconditionally every IRQ, same as downstream; what happens after
+ * that is gated by rm31080_ctrl_configure()'s scan_mode_state read, which
+ * is RM_NEED_TO_SEND_SCAN | RM_NEED_TO_READ_RAW_DATA | RM_NEED_TO_SEND_SIGNAL
+ * in the steady-state ACTIVE case (scan-start, pull one image into the
+ * ring buffer, signal the HAL) and RM_NEED_NONE or RM_NEED_TO_SEND_SCAN
+ * alone during the one-shot PRE_IDLE/IDLE transitions -- see the NOTE on
+ * scan_mode_state above.
  * ========================================================================= */
 
 static void rm31080_irq_work(struct work_struct *work)
 {
 	struct rm31080_data *rm = container_of(work, struct rm31080_data, irq_work);
 	u8 *slot;
-	int clear_ret, scan_ret, img_ret = -1;
+	u32 flag;
+	int clear_ret, scan_ret = 0, img_ret = -1;
 
 	if (!rm->init_finished || rm->is_suspended) {
 		dev_dbg_ratelimited(&rm->spi->dev,
@@ -1105,28 +1312,33 @@ static void rm31080_irq_work(struct work_struct *work)
 	}
 
 	clear_ret = rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_CLEARINT]);
-	scan_ret = rm31080_ctrl_scan_start(rm);
+	flag = rm31080_ctrl_configure(rm);
 
-	mutex_lock(&rm->q_lock);
-	slot = rm31080_q_enqueue_start(rm);
-	mutex_unlock(&rm->q_lock);
+	if (flag & RM_NEED_TO_SEND_SCAN)
+		scan_ret = rm31080_ctrl_scan_start(rm);
 
-	if (slot) {
-		img_ret = rm31080_read_image(rm, slot, rm->ctrl.u16_data_length ?
-					      rm->ctrl.u16_data_length : RM_RAW_DATA_LENGTH);
-		if (!img_ret) {
-			mutex_lock(&rm->q_lock);
-			rm31080_q_enqueue_finish(rm);
-			mutex_unlock(&rm->q_lock);
+	if (flag & RM_NEED_TO_READ_RAW_DATA) {
+		mutex_lock(&rm->q_lock);
+		slot = rm31080_q_enqueue_start(rm);
+		mutex_unlock(&rm->q_lock);
+
+		if (slot) {
+			img_ret = rm31080_read_image(rm, slot, rm->ctrl.u16_data_length ?
+						      rm->ctrl.u16_data_length : RM_RAW_DATA_LENGTH);
+			if (!img_ret) {
+				mutex_lock(&rm->q_lock);
+				rm31080_q_enqueue_finish(rm);
+				mutex_unlock(&rm->q_lock);
+			}
 		}
 	}
 
 	dev_dbg_ratelimited(&rm->spi->dev,
-		"irq_work: clear_int=%d scan_start=%d slot=%s read_image=%d data_length=%u\n",
-		clear_ret, scan_ret, slot ? "ok" : "NULL(queue full?)", img_ret,
+		"irq_work: clear_int=%d scan_mode_state=%u flag=0x%x scan_start=%d read_image=%d data_length=%u\n",
+		clear_ret, rm->scan_mode_state, flag, scan_ret, img_ret,
 		rm->ctrl.u16_data_length);
 
-	if (rm->calc_finished) {
+	if ((flag & RM_NEED_TO_SEND_SIGNAL) && rm->calc_finished) {
 		rm->calc_finished = false;
 		rm31080_send_signal(rm, RM_SIGNAL_INTR);
 	}
@@ -1136,6 +1348,24 @@ static irqreturn_t rm31080_irq(int irq, void *data)
 {
 	struct rm31080_data *rm = data;
 	bool will_process = rm->init_service && rm->init_finished && !rm->is_suspended;
+
+	/* rm_tch_irq(): a real touch IRQ landing at all is itself proof of
+	 * life, same as a successful watchdog table run -- reset the
+	 * countdown unconditionally, not just from the timer tick. */
+	rm->watchdog_cnt = 0;
+
+	/* Unprotected read of scan_mode_state, matching downstream: this is
+	 * a best-effort wake/activity hint for Android's input stack, not
+	 * a correctness-critical decision, so it doesn't need scan_mode_lock
+	 * (rm31080_irq() runs threaded/sleepable here, but downstream's
+	 * equivalent doesn't, and taking the lock on every single touch IRQ
+	 * just for a hint isn't worth the contention). The real transition
+	 * out of IDLE_MODE still happens properly locked, in
+	 * rm31080_ctrl_configure() via rm31080_irq_work() below. */
+	if (rm->scan_mode_state == RM_SCAN_IDLE_MODE) {
+		input_event(rm->input, EV_MSC, MSC_ACTIVITY, 1);
+		input_sync(rm->input);
+	}
 
 	dev_dbg_ratelimited(&rm->spi->dev,
 		"hw irq fired (init_service=%d init_finished=%d is_suspended=%d -> %s)\n",
@@ -1180,15 +1410,26 @@ static void rm31080_timer_work(struct work_struct *work)
 	}
 
 	if (triggered && rm->init_finished && !rm->is_suspended) {
-		/* rm_watchdog_work_function(RM_SCAN_ACTIVE_MODE) -- our
-		 * ACTIVE-only simplification means we always take the
-		 * ACTIVE_MODE branch (see the NOTE on scan_mode_state
-		 * above), never the IDLE_MODE one that instead sets
-		 * b_watch_dog_check + RM_SIGNAL_WATCH_DOG_CHECK. */
+		/*
+		 * rm_watchdog_work_function(): when scan_mode_state is
+		 * ACTIVE, a watchdog-time expiry requests a direct table
+		 * run (watchdog_flg) same as always. When it's PRE_IDLE or
+		 * IDLE, the idle KRL table owns the SPI bus autonomously,
+		 * so running KRL_INDEX_RM_WATCHDOG here would race it --
+		 * instead we just flag watchdog_check and let userspace
+		 * decide via RM_SIGNAL_WATCH_DOG_CHECK, exactly like
+		 * downstream's RM_SCAN_IDLE_MODE branch.
+		 */
 		if (rm->watchdog_enable) {
 			if (rm->watchdog_cnt++ >= rm->watchdog_time) {
 				rm->watchdog_cnt = 0;
-				rm->watchdog_flg = true;
+
+				mutex_lock(&rm->scan_mode_lock);
+				if (rm->scan_mode_state == RM_SCAN_ACTIVE_MODE)
+					rm->watchdog_flg = true;
+				else
+					rm->watchdog_check = true;
+				mutex_unlock(&rm->scan_mode_lock);
 			}
 
 			if (rm->watchdog_flg) {
@@ -1236,6 +1477,14 @@ static void rm31080_timer_work(struct work_struct *work)
 				dev_dbg(&rm->spi->dev,
 					"watchdog: table execution finished, ret=%d\n", wd_ret);
 			}
+		}
+
+		if (rm->watchdog_check) {
+			dev_dbg(&rm->spi->dev,
+				"watchdog: deferring to userspace via RM_SIGNAL_WATCH_DOG_CHECK (scan_mode_state=%u)\n",
+				rm->scan_mode_state);
+			rm31080_send_signal(rm, RM_SIGNAL_WATCH_DOG_CHECK);
+			rm->watchdog_check = false;
 		}
 	}
 
@@ -1288,11 +1537,33 @@ static void rm31080_watchdog_configure(struct rm31080_data *rm, unsigned long ar
 static int rm31080_open(struct inode *inode, struct file *filp)
 {
 	filp->private_data = g_rm;
+	atomic_inc(&g_rm->open_count);
 	return 0;
 }
 
 static int rm31080_release(struct inode *inode, struct file *filp)
 {
+	struct rm31080_data *rm = filp->private_data;
+
+	/* Only reset on the LAST close -- see the NOTE on open_count above.
+	 * A secondary opener closing early (debug tooling, udev, etc.)
+	 * must not tear down the primary (HAL) session's state. */
+	if (!atomic_dec_and_test(&rm->open_count))
+		return 0;
+
+	/* Ported from dev_release(): the touch IRQ isn't tied to whether
+	 * the char device is held open, so without this the pipeline would
+	 * keep running full ACTIVE-mode scan/read/signal cycles against no
+	 * HAL to receive them once userspace closes the fd. init_finished
+	 * gates both rm31080_irq() (queues no further work) and
+	 * rm31080_irq_work() (bails immediately if already queued) --
+	 * see the flush_workqueue() ordering note on
+	 * rm31080_ctrl_enter_manual_mode(). */
+	rm->init_finished = false;
+	rm31080_ctrl_enter_manual_mode(rm);
+
+	dev_dbg(&rm->spi->dev, "device released (last close): init_finished=false, forced to ACTIVE_MODE\n");
+
 	return 0;
 }
 
@@ -1379,8 +1650,10 @@ static u32 rm31080_get_variable(struct rm31080_data *rm, unsigned int index, u8 
 		val = rm->spi_locked | rm->is_suspended;
 		break;
 	default:
+		dev_dbg(&rm->spi->dev, "GET_VARIABLE: unhandled index=%u\n", index);
 		return -EINVAL;
 	}
+	dev_dbg(&rm->spi->dev, "GET_VARIABLE: index=%u val=%u\n", index, val);
 	return copy_to_user(p, &val, 1) ? RETURN_FAIL : RETURN_OK;
 }
 
@@ -1388,8 +1661,17 @@ static void rm31080_set_variable(struct rm31080_data *rm, unsigned int index, un
 {
 	switch (index) {
 	case RM_VARIABLE_AUTOSCAN_FLAG:
-		/* NOTE: no-op under the always-active scan model; see the
-		 * NOTE on scan_mode_state above. */
+		/* downstream's switch case ignores arg entirely (userspace
+		 * only ever passes 1 anyway) and only fires the transition
+		 * out of ACTIVE_MODE -- calling this again while already
+		 * PRE_IDLE/IDLE is a silent no-op, exactly like here. */
+		mutex_lock(&rm->scan_mode_lock);
+		if (rm->scan_mode_state == RM_SCAN_ACTIVE_MODE)
+			rm->scan_mode_state = RM_SCAN_PRE_IDLE_MODE;
+		mutex_unlock(&rm->scan_mode_lock);
+		dev_dbg(&rm->spi->dev,
+			"SET_VARIABLE(AUTOSCAN_FLAG): scan_mode_state=%u\n",
+			rm->scan_mode_state);
 		break;
 	case RM_VARIABLE_WATCHDOG_FLAG:
 		rm31080_watchdog_configure(rm, arg);
@@ -1478,6 +1760,8 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 		if (rm->hal_pid)
 			put_pid(rm->hal_pid);
 		rm->hal_pid = get_pid(find_get_pid((pid_t)arg));
+		dev_dbg(&rm->spi->dev, "SET_HAL_PID: pid=%d %s\n", (pid_t)arg,
+			rm->hal_pid ? "acquired" : "lookup failed");
 		break;
 	case RM_IOCTL_WATCH_DOG:
 		rm31080_watchdog_request(rm);
@@ -1487,11 +1771,13 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 		break;
 	case RM_IOCTL_INIT_START:
 		rm->init_finished = false;
-		flush_workqueue(rm->wq);
+		rm31080_ctrl_enter_manual_mode(rm);
+		dev_dbg(&rm->spi->dev, "INIT_START: init_finished=false, forced to ACTIVE_MODE\n");
 		break;
 	case RM_IOCTL_INIT_END:
 		rm->init_finished = true;
 		rm->calc_finished = true;
+		dev_dbg(&rm->spi->dev, "INIT_END: init_finished=true, calc_finished=true\n");
 		break;
 	case RM_IOCTL_SCRIBER_CTRL:
 		/* NOTE: scriber (palm-rejection style) mode flag; stored but
@@ -1510,6 +1796,11 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 			input_set_abs_params(rm->input, ABS_Y, 0,
 					      rm->ctrl.u16_resolution_y - 1, 0, 0);
 		}
+		dev_dbg(&rm->spi->dev,
+			"SET_PARAMETER: data_length=%u resolution=%ux%u timer_trigger_scale=%u idle_mode_check=%u watch_dog_normal_cnt=%u\n",
+			rm->ctrl.u16_data_length, rm->ctrl.u16_resolution_x,
+			rm->ctrl.u16_resolution_y, rm->ctrl.u8_timer_trigger_scale,
+			rm->ctrl.u8_idle_mode_check, rm->ctrl.u8_watch_dog_normal_cnt);
 		break;
 	case RM_IOCTL_SET_BASELINE: {
 		size_t len = rm->ctrl.u16_data_length ? rm->ctrl.u16_data_length : RM_RAW_DATA_LENGTH;
@@ -1550,6 +1841,7 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 		memset(rm->krl_tbl[index], 0, KRL_TBL_MAX_LEN);
 		if (copy_from_user(rm->krl_tbl[index], argp, len))
 			return -EFAULT;
+		dev_dbg(&rm->spi->dev, "SET_KRL_TBL: index=%u len=%u\n", index, len);
 		break;
 	}
 	case RM_IOCTL_GET_SCAN_MODE: {
@@ -1560,6 +1852,7 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 	}
 	case RM_IOCTL_INIT_SERVICE:
 		rm->init_service = true;
+		dev_dbg(&rm->spi->dev, "INIT_SERVICE: init_service=true\n");
 		break;
 	case RM_IOCTL_SET_CLK:
 		if (rm->clk) {
@@ -1568,6 +1861,8 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 			else
 				clk_disable_unprepare(rm->clk);
 		}
+		dev_dbg(&rm->spi->dev, "SET_CLK: arg=%lu clk_present=%d ret=%ld\n",
+			arg, !!rm->clk, ret);
 		break;
 	default:
 		return -EINVAL;
@@ -1637,6 +1932,7 @@ static int rm31080_probe(struct spi_device *spi)
 	mutex_init(&rm->krl_lock);
 	mutex_init(&rm->q_lock);
 	mutex_init(&rm->ns_mode_lock);
+	mutex_init(&rm->scan_mode_lock);
 	rm->ns_last_rpt = 1;	/* matches downstream's static u8Rpt = 1 */
 	INIT_WORK(&rm->irq_work, rm31080_irq_work);
 	INIT_DELAYED_WORK(&rm->timer_work, rm31080_timer_work);
