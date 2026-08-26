@@ -44,6 +44,11 @@
  *   reset-gpios     = the reset GPIO, GPIO_ACTIVE_LOW
  *   avdd-supply     = 3.3V analog rail
  *   dvdd-supply     = 1.8V digital rail
+ *   avdd-gpios      = optional; discrete-GPIO alternative to avdd-supply on
+ *                      boards that switch this rail via GPIO instead of a
+ *                      regulator. Not used by this board's DT (avdd-supply
+ *                      above covers it) -- see krl_config_3v3().
+ *   dvdd-gpios      = same, for the 1.8V rail / dvdd-supply
  *   clocks / clock-names = "extern2" (the touch clock parent chain)
  *   raydium,platform-id  = <0x0b>   (RM_PLATFORM_T008; REQUIRED, see below)
  *   raydium,gpio-select  = <0x00>  (optional, defaults to 0)
@@ -342,6 +347,18 @@ struct rm31080_data {
 
 	struct regulator *avdd;	/* 3.3V analog supply */
 	struct regulator *dvdd;	/* 1.8V digital supply */
+	/*
+	 * Optional discrete-GPIO alternative to avdd-supply/dvdd-supply,
+	 * ported from downstream's pdata->gpio_3v3/gpio_1v8 (consulted by
+	 * KRL_CMD_CONFIG_3V3/1V8's GPIO sub-cmd, as opposed to the
+	 * REGULATOR sub-cmd that avdd/dvdd above serve). NULL on this
+	 * board -- our DT always models both rails as real regulators, so
+	 * this is dead weight here -- but not every board with this
+	 * touchscreen necessarily does; wired up for that portability, not
+	 * because this board needs it. See krl_config_3v3()/_1v8().
+	 */
+	struct gpio_desc *gpio_avdd;
+	struct gpio_desc *gpio_dvdd;
 	struct clk *clk;		/* touch clock (extern2/clk_out_2 chain) */
 
 	u32 platform_id;		/* from DT raydium,platform-id */
@@ -646,13 +663,19 @@ static int krl_config_3v3(struct rm31080_data *rm, u8 sub_cmd, u8 on_off)
 			return RETURN_FAIL;
 		ret = on_off ? regulator_enable(rm->avdd) : regulator_disable(rm->avdd);
 	} else if (sub_cmd == KRL_SUB_CMD_SET_3V3_GPIO) {
-		/* NOTE: downstream also supported a discrete GPIO-switched
-		 * 3.3V rail (pdata->gpio_3v3) instead of a regulator. Our DT
-		 * always models this as a regulator (avdd-supply), so this
-		 * branch is intentionally unimplemented; add a gpio_desc
-		 * here if a board ever needs it. */
-		dev_warn(&rm->spi->dev, "KRL CONFIG_3V3 GPIO sub-cmd unsupported\n");
-		ret = RETURN_FAIL;
+		/* downstream: gpio_direction_output(pdata->gpio_3v3, on_off).
+		 * Optional -- see the NOTE on gpio_avdd above. A board whose
+		 * KRL tables actually exercise this sub-cmd needs avdd-gpios
+		 * in its DT; one that doesn't (ours) never reaches here in
+		 * practice, since our tables only ever use the REGULATOR
+		 * sub-cmd above. */
+		if (!rm->gpio_avdd) {
+			dev_warn(&rm->spi->dev,
+				 "KRL CONFIG_3V3 GPIO sub-cmd requested but no avdd-gpios in DT\n");
+			return RETURN_FAIL;
+		}
+		gpiod_direction_output_raw(rm->gpio_avdd, on_off);
+		ret = RETURN_OK;
 	}
 	return ret;
 }
@@ -666,8 +689,15 @@ static int krl_config_1v8(struct rm31080_data *rm, u8 sub_cmd, u8 on_off)
 			return RETURN_FAIL;
 		ret = on_off ? regulator_enable(rm->dvdd) : regulator_disable(rm->dvdd);
 	} else if (sub_cmd == KRL_SUB_CMD_SET_1V8_GPIO) {
-		dev_warn(&rm->spi->dev, "KRL CONFIG_1V8 GPIO sub-cmd unsupported\n");
-		ret = RETURN_FAIL;
+		/* downstream: gpio_direction_output(pdata->gpio_1v8, on_off).
+		 * Same NOTE as krl_config_3v3()'s GPIO branch. */
+		if (!rm->gpio_dvdd) {
+			dev_warn(&rm->spi->dev,
+				 "KRL CONFIG_1V8 GPIO sub-cmd requested but no dvdd-gpios in DT\n");
+			return RETURN_FAIL;
+		}
+		gpiod_direction_output_raw(rm->gpio_dvdd, on_off);
+		ret = RETURN_OK;
 	}
 	return ret;
 }
@@ -2000,6 +2030,22 @@ static int rm31080_probe(struct spi_device *spi)
 	rm->dvdd = devm_regulator_get(dev, "dvdd");
 	if (IS_ERR(rm->dvdd))
 		return dev_err_probe(dev, PTR_ERR(rm->dvdd), "failed to get dvdd-supply\n");
+
+	/* Optional discrete-GPIO alternative to avdd-supply/dvdd-supply --
+	 * see the NOTE on gpio_avdd/gpio_dvdd above. NULL (not a probe
+	 * failure) when absent, which is the normal case on boards like
+	 * ours that power both rails via regulators instead. No initial
+	 * state is forced here: unlike gpio_reset, which this driver drives
+	 * unconditionally as part of every probe, these are only ever
+	 * touched on demand by a KRL table's CONFIG_3V3/1V8 GPIO sub-cmd on
+	 * boards that have one, which sets its own on/off state explicitly
+	 * before relying on it. */
+	rm->gpio_avdd = devm_gpiod_get_optional(dev, "avdd", GPIOD_ASIS);
+	if (IS_ERR(rm->gpio_avdd))
+		return dev_err_probe(dev, PTR_ERR(rm->gpio_avdd), "failed to get avdd gpio\n");
+	rm->gpio_dvdd = devm_gpiod_get_optional(dev, "dvdd", GPIOD_ASIS);
+	if (IS_ERR(rm->gpio_dvdd))
+		return dev_err_probe(dev, PTR_ERR(rm->gpio_dvdd), "failed to get dvdd gpio\n");
 
 	rm->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(rm->clk))
