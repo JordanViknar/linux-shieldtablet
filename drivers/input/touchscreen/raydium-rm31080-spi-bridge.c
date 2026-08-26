@@ -1143,9 +1143,12 @@ static void rm31080_wait_for_scan_finish(struct rm31080_data *rm)
 static int rm31080_ctrl_scan_start(struct rm31080_data *rm)
 {
 	if (rm->ctrl.u8_ns_func_enable & 0x01) {
+		u8 prev_idx;
+
 		rm31080_wait_for_scan_finish(rm);
 
 		mutex_lock(&rm->ns_mode_lock);
+		prev_idx = rm->ns_sel_idx;
 		rm->ns_sel = rm->ns_para[rm->ns_sel_idx];
 		if (rm->ns_sel_idx < rm->ns_mode)
 			rm->ns_sel_idx++;
@@ -1157,6 +1160,11 @@ static int rm31080_ctrl_scan_start(struct rm31080_data *rm)
 			rm31080_set_repeat_times(rm, rm->ns_last_rpt);
 		}
 		rm31080_set_ns_para(rm, rm->ns_sel_idx);
+
+		dev_dbg_ratelimited(&rm->spi->dev,
+			"freq hop: ns_mode=%u col %u->%u ns_sel=%u ns_rpt=%u\n",
+			rm->ns_mode, prev_idx, rm->ns_sel_idx, rm->ns_sel, rm->ns_last_rpt);
+
 		mutex_unlock(&rm->ns_mode_lock);
 	} else {
 		rm->ns_sel_idx = 0;
