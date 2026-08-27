@@ -85,6 +85,14 @@
 			raydium,platform-id = <0x0B>;
 			raydium,gpio-select = <0x00>;
 
+			/*
+			 * Replaces the old Xorg configuration.
+			 */
+			touchscreen-size-x = <1200>;
+			touchscreen-size-y = <1920>;
+			touchscreen-inverted-x;
+			touchscreen-inverted-y;
+
 			spi-max-frequency = <18000000>;
 			nvidia,tx-clk-tap-delay = <16>;
 			nvidia,rx-clk-tap-delay = <0>;

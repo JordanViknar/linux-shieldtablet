@@ -77,6 +77,8 @@
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
 #include <linux/miscdevice.h>
+#include <linux/kobject.h>
+#include <linux/pm_wakeup.h>
 #include <linux/fs.h>
 #include <linux/poll.h>
 #include <linux/spi/spi.h>
@@ -87,6 +89,7 @@
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/pm.h>
+#include <linux/property.h>
 
 /*
  * MSC_ACTIVITY isn't in mainline uapi/linux/input.h (it stops at
@@ -161,6 +164,14 @@
 #define RM_VARIABLE_NS_MODE		0x0C
 #define RM_VARIABLE_TOUCHFILE_STATUS	0x0D
 #define RM_VARIABLE_TOUCH_EVENT		0x0E
+
+/* RM_VARIABLE_TOUCH_EVENT's arg values, ported from enum tch_update_reason
+ * in rm31080a_ts.h. Confirmed live: librm31080.so's WaterAreaDetection()
+ * and its noise-detection counterpart call SendTouchEvent2Kernel(1) / (2)
+ * / (0xff) exactly matching these. */
+#define RM_TOUCH_EVENT_STYLUS_DISABLE_BY_WATER	0x01
+#define RM_TOUCH_EVENT_STYLUS_DISABLE_BY_NOISE	0x02
+#define RM_TOUCH_EVENT_STYLUS_IS_ENABLED	0xFF
 
 /* GET_VARIABLE has its own, differently-numbered index space */
 #define RM_VARIABLE_PLATFORM_ID	0x01
@@ -268,6 +279,11 @@ struct rm_touch_event {
 #define POINT_TYPE_THUMB	0x04
 
 #define MAX_SLOT_AMOUNT		10	/* MAX_REPORT_TOUCHED_POINTS downstream */
+/* Compile-time fallback ONLY, used when the DT node has no
+ * touchscreen-size-x/y properties (see rm->default_res_x/y and the DTS
+ * NOTE on those properties). Not this board's real panel resolution --
+ * deliberately generic so a board without DT properties still gets a
+ * consistent (if uncalibrated) axis range instead of an unset one. */
 #define RM_INPUT_RESOLUTION_X	4096
 #define RM_INPUT_RESOLUTION_Y	4096
 
@@ -363,6 +379,28 @@ struct rm31080_data {
 
 	u32 platform_id;		/* from DT raydium,platform-id */
 	u32 gpio_select;		/* from DT raydium,gpio-select */
+
+	/*
+	 * ABS_(MT_)X/Y max we advertise at input_register_device() time and
+	 * fall back to in rm31080_report_pointer() until RM_IOCTL_SET_PARAMETER
+	 * (if ever) supplies ctrl.u16_resolution_x/y instead. From DT
+	 * touchscreen-size-x/y when present, else RM_INPUT_RESOLUTION_X/Y.
+	 * This -- not a runtime ioctl from a closed-source HAL that may not
+	 * fire before some other process has already enumerated the input
+	 * device -- is what makes the axis range correct from first
+	 * enumeration onward, which is the whole point: it's what lets
+	 * userspace (libinput, and therefore both X11 and Wayland
+	 * compositors) auto-calibrate without a manual Xorg "Calibration"
+	 * quirk. See the NOTE on touchscreen-size-x/y in the DTS.
+	 */
+	u16 default_res_x;
+	u16 default_res_y;
+
+	/*
+	 * Replaces the old Xorg configuration.
+	 */
+	bool invert_x;
+	bool invert_y;
 
 	/* KRL bytecode tables, uploaded by userspace via
 	 * RM_IOCTL_SET_KRL_TBL. Index space is KRL_INDEX_*. */
@@ -467,6 +505,43 @@ struct rm31080_data {
 						 * of running it directly, since the
 						 * idle KRL table owns the SPI bus
 						 * autonomously while idle */
+
+	/*
+	 * Both confirmed live: librm31080.so calls
+	 * SET_VARIABLE(TOUCHFILE_STATUS/TOUCH_EVENT) directly (see the
+	 * RM_VARIABLE_TOUCH_EVENT NOTE above for TOUCH_EVENT specifically).
+	 */
+	u8 touchfile_check;	/* g_st_ts.u8_touchfile_check: opaque
+				 * calibration-file-load status/error byte.
+				 * Downstream's only consumer is a sysfs show
+				 * handler we don't have, so this is stored and
+				 * dev_dbg-logged but otherwise inert here --
+				 * the specific error-code meanings (checksum
+				 * mismatch, bad version, ...) are HAL-internal,
+				 * not part of this driver's protocol. */
+	u8 touch_event;		/* g_st_ts.u8_touch_event: see
+				 * rm31080_set_variable()'s
+				 * RM_VARIABLE_TOUCH_EVENT case, which is the
+				 * actual functional consumer (a uevent, not
+				 * just storage). */
+
+	/*
+	 * g_st_ts.wakelock_initialization, ported to the modern wakeup_source
+	 * API (struct wake_lock/wake_lock_init/wake_lock_timeout/wake_unlock
+	 * were removed from mainline years ago). Acquired with a bounded
+	 * timeout in rm31080_resume() -- matching downstream's
+	 * TCH_WAKE_LOCK_TIMEOUT (HZ/2, i.e. 500ms regardless of HZ) -- so the
+	 * system can't suspend again mid-reinit; released early once
+	 * userspace confirms reinit is done, via either RM_IOCTL_INIT_END or
+	 * RM_VARIABLE_SET_WAKE_UNLOCK (downstream's two release call sites,
+	 * both ported as-is). __pm_relax() is safe to call whether or not a
+	 * timeout is currently outstanding, so unlike downstream's explicit
+	 * wake_lock_active() guard, both release sites here call it
+	 * unconditionally. NULL if registration failed at probe (treated as
+	 * non-fatal -- this is a power-management nicety, not worth failing
+	 * probe over); all three use sites guard on that.
+	 */
+	struct wakeup_source *wakelock_init;
 
 	/*
 	 * Frequency hopping / noise-scan channel cycling. Ported from
@@ -1028,8 +1103,8 @@ static void rm31080_report_pointer(struct rm31080_data *rm, struct rm_touch_even
 		max_x = rm->ctrl.u16_resolution_x;
 		max_y = rm->ctrl.u16_resolution_y;
 	} else {
-		max_x = RM_INPUT_RESOLUTION_X;
-		max_y = RM_INPUT_RESOLUTION_Y;
+		max_x = rm->default_res_x;
+		max_y = rm->default_res_y;
 	}
 
 	count = max(rm->last_touch_count, tp->uc_touch_count);
@@ -1097,10 +1172,20 @@ static void rm31080_report_pointer(struct rm31080_data *rm, struct rm_touch_even
 		}
 
 		input_mt_report_slot_state(rm->input, tool, true);
-		input_report_abs(rm->input, ABS_MT_POSITION_X,
-				  min_t(u16, tp->us_x[i], max_x - 1));
-		input_report_abs(rm->input, ABS_MT_POSITION_Y,
-				  min_t(u16, tp->us_y[i], max_y - 1));
+		{
+			/* Orientation transform, see the NOTE on invert_x/y
+			 * in the struct above. */
+			u16 x = min_t(u16, tp->us_x[i], max_x - 1);
+			u16 y = min_t(u16, tp->us_y[i], max_y - 1);
+
+			if (rm->invert_x)
+				x = max_x - 1 - x;
+			if (rm->invert_y)
+				y = max_y - 1 - y;
+
+			input_report_abs(rm->input, ABS_MT_POSITION_X, x);
+			input_report_abs(rm->input, ABS_MT_POSITION_Y, y);
+		}
 		input_report_abs(rm->input, ABS_MT_PRESSURE, tp->us_z[i]);
 
 		if (tp->uc_tool_type[i] == POINT_TYPE_ERASER)
@@ -1771,17 +1856,100 @@ static void rm31080_set_variable(struct rm31080_data *rm, unsigned int index, un
 	case RM_VARIABLE_TEST_VERSION:
 	case RM_VARIABLE_SELF_TEST_RESULT:
 	case RM_VARIABLE_SCRIBER_FLAG:
-	case RM_VARIABLE_IDLEMODECHECK:
-	case RM_VARIABLE_SET_WAKE_UNLOCK:
-	case RM_VARIABLE_TOUCHFILE_STATUS:
-	case RM_VARIABLE_TOUCH_EVENT:
 	default:
-		/* NOTE: these are diagnostic/self-test/uevent hooks in
-		 * downstream (rm_tch_enter_test_mode(),
-		 * rm_tch_generate_event(), ...) that don't affect the basic
-		 * touch data path. Accepted and otherwise ignored for now. */
+		/* NOTE: these are diagnostic/self-test hooks in downstream
+		 * (rm_tch_enter_test_mode(), ...) that don't affect the
+		 * basic touch data path. Accepted and otherwise ignored. */
+		break;
+	case RM_VARIABLE_SET_WAKE_UNLOCK:
+		/* Ported: see the NOTE on wakelock_init above. Unlike
+		 * downstream's wake_lock_active() guard, __pm_relax() is
+		 * safe to call unconditionally. */
+		if (rm->wakelock_init)
+			__pm_relax(rm->wakelock_init);
+		dev_dbg(&rm->spi->dev, "SET_VARIABLE(SET_WAKE_UNLOCK)\n");
+		break;
+	case RM_VARIABLE_IDLEMODECHECK:
+		/*
+		 * Verbatim port of downstream's case: a whole-byte overwrite
+		 * of the same ctrl.u8_idle_mode_check field that
+		 * rm31080_ctrl_enter_auto_mode()/_leave_auto_mode() toggle
+		 * bit 0 of (see the NOTE on scan_mode_state). We couldn't
+		 * confirm the exact arg value at the one userspace call site
+		 * we found (librm31080.so elides it in decompilation), but
+		 * downstream applies this unconditionally with no bit-0
+		 * preservation and no locking either, so we match that
+		 * exactly rather than second-guessing it.
+		 */
+		rm->ctrl.u8_idle_mode_check = (u8)arg;
+		dev_dbg(&rm->spi->dev, "SET_VARIABLE(IDLEMODECHECK): ctrl.u8_idle_mode_check=0x%02x\n",
+			rm->ctrl.u8_idle_mode_check);
+		break;
+	case RM_VARIABLE_TOUCHFILE_STATUS:
+		/* Confirmed live: librm31080.so's send_file_info_to_kernel()
+		 * reports calibration-file load status here (0 = OK; nonzero
+		 * = a HAL-defined error code -- checksum mismatch, bad
+		 * version, etc. -- not part of this driver's protocol).
+		 * Downstream's only consumer is a sysfs show handler we
+		 * don't implement, so this is stored and logged but
+		 * otherwise inert. */
+		rm->touchfile_check = (u8)arg;
+		dev_dbg(&rm->spi->dev, "SET_VARIABLE(TOUCHFILE_STATUS): 0x%02x\n",
+			rm->touchfile_check);
+		break;
+	case RM_VARIABLE_TOUCH_EVENT: {
+		/* Confirmed live: librm31080.so's WaterAreaDetection() and
+		 * its noise-detection counterpart call this directly (values
+		 * matching the RM_TOUCH_EVENT_* constants above exactly).
+		 * Unlike TOUCHFILE_STATUS, downstream's consumer here
+		 * (rm_tch_generate_event()) is NOT sysfs-gated -- it fires a
+		 * uevent unconditionally, so this is a real behavioural port,
+		 * not just bookkeeping. */
+		char *reason;
+		char envp_reason[24];
+		char *envp[] = { envp_reason, NULL };
+
+		rm->touch_event = (u8)arg;
+		switch (rm->touch_event) {
+		case RM_TOUCH_EVENT_STYLUS_DISABLE_BY_WATER:
+			reason = "Water";
+			break;
+		case RM_TOUCH_EVENT_STYLUS_DISABLE_BY_NOISE:
+			reason = "Noise";
+			break;
+		case RM_TOUCH_EVENT_STYLUS_IS_ENABLED:
+			reason = "None";
+			break;
+		default:
+			reason = "Others";
+			break;
+		}
+		snprintf(envp_reason, sizeof(envp_reason), "STYLUS_DISABLE=%s", reason);
+
+		dev_dbg(&rm->spi->dev, "SET_VARIABLE(TOUCH_EVENT): 0x%02x -> %s\n",
+			rm->touch_event, envp_reason);
+		kobject_uevent_env(&rm->miscdev.this_device->kobj, KOBJ_CHANGE, envp);
 		break;
 	}
+	}
+}
+
+/*
+ * Mirrors one (res_x, res_y) size pair onto both the MT and single-touch
+ * (declarative-only, see rm31080_probe()) axes. Called with DT/fallback
+ * sizes at probe time and again with whatever RM_IOCTL_SET_PARAMETER
+ * supplies at runtime -- both need the same treatment, hence factoring it
+ * out rather than duplicating it. Inversion (invert_x/invert_y) doesn't
+ * affect the advertised range, only the reported value at each point (see
+ * rm31080_report_pointer()), so there's nothing orientation-related to do
+ * here beyond the plain set.
+ */
+static void rm31080_set_input_abs_range(struct rm31080_data *rm, u16 res_x, u16 res_y)
+{
+	input_set_abs_params(rm->input, ABS_MT_POSITION_X, 0, res_x - 1, 0, 0);
+	input_set_abs_params(rm->input, ABS_MT_POSITION_Y, 0, res_y - 1, 0, 0);
+	input_set_abs_params(rm->input, ABS_X, 0, res_x - 1, 0, 0);
+	input_set_abs_params(rm->input, ABS_Y, 0, res_y - 1, 0, 0);
 }
 
 static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -1833,6 +2001,8 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 	case RM_IOCTL_INIT_END:
 		rm->init_finished = true;
 		rm->calc_finished = true;
+		if (rm->wakelock_init)
+			__pm_relax(rm->wakelock_init);
 		dev_dbg(&rm->spi->dev, "INIT_END: init_finished=true, calc_finished=true\n");
 		break;
 	case RM_IOCTL_SCRIBER_CTRL:
@@ -1842,16 +2012,9 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 	case RM_IOCTL_SET_PARAMETER:
 		if (copy_from_user(&rm->ctrl, argp, sizeof(rm->ctrl)))
 			return -EFAULT;
-		if (rm->ctrl.u16_resolution_x && rm->ctrl.u16_resolution_y) {
-			input_set_abs_params(rm->input, ABS_MT_POSITION_X, 0,
-					      rm->ctrl.u16_resolution_x - 1, 0, 0);
-			input_set_abs_params(rm->input, ABS_MT_POSITION_Y, 0,
-					      rm->ctrl.u16_resolution_y - 1, 0, 0);
-			input_set_abs_params(rm->input, ABS_X, 0,
-					      rm->ctrl.u16_resolution_x - 1, 0, 0);
-			input_set_abs_params(rm->input, ABS_Y, 0,
-					      rm->ctrl.u16_resolution_y - 1, 0, 0);
-		}
+		if (rm->ctrl.u16_resolution_x && rm->ctrl.u16_resolution_y)
+			rm31080_set_input_abs_range(rm, rm->ctrl.u16_resolution_x,
+						     rm->ctrl.u16_resolution_y);
 		dev_dbg(&rm->spi->dev,
 			"SET_PARAMETER: data_length=%u resolution=%ux%u timer_trigger_scale=%u idle_mode_check=%u watch_dog_normal_cnt=%u\n",
 			rm->ctrl.u16_data_length, rm->ctrl.u16_resolution_x,
@@ -2125,6 +2288,15 @@ static int rm31080_probe(struct spi_device *spi)
 	__set_bit(EV_ABS, rm->input->evbit);
 	__set_bit(EV_KEY, rm->input->evbit);
 	__set_bit(BTN_TOOL_RUBBER, rm->input->keybit);
+	/*
+	 * The modern, portable way to tell userspace "this is a direct-touch
+	 * touchscreen" -- libinput (under both X11 and, critically, Wayland
+	 * compositors that never read Xorg.conf at all) uses this INPUT_PROP
+	 * bit directly, rather than the legacy Xorg evdev driver's
+	 * MatchIsTouchscreen heuristics (BTN_TOOL_RUBBER presence, see the
+	 * NOTE just below) that predate it.
+	 */
+	__set_bit(INPUT_PROP_DIRECT, rm->input->propbit);
 	/* Capability-only, never actually reported: ported from the L4T
 	 * fork, which declares these (but never calls input_report_key/abs
 	 * on them -- verified, neither it nor android_kernel's rm31080a_ts.c
@@ -2135,11 +2307,36 @@ static int rm31080_probe(struct spi_device *spi)
 	 * fires, the IRQ never gets unmasked, and the raw-data queue never
 	 * gets populated -- exactly the symptom this was chasing. */
 	input_set_capability(rm->input, EV_KEY, BTN_TOUCH);
-	input_set_abs_params(rm->input, ABS_X, 0, RM_INPUT_RESOLUTION_X - 1, 0, 0);
-	input_set_abs_params(rm->input, ABS_Y, 0, RM_INPUT_RESOLUTION_Y - 1, 0, 0);
+
+	/*
+	 * NOT downstream: g_st_ts here just has ABS_(MT_)X/Y range hardcoded
+	 * to RM_INPUT_RESOLUTION_X/Y (was 4096x4096, an arbitrary square
+	 * placeholder unrelated to this board's actual 1200x1920 panel) and
+	 * relies entirely on RM_IOCTL_SET_PARAMETER to correct it later, at
+	 * whatever point the closed-source HAL happens to call it. That is
+	 * exactly the "wrong until a manual Xorg Calibration quirk compensates
+	 * for it" symptom this replaces -- if libinput/Wayland enumerate this
+	 * device before SET_PARAMETER ever fires, they cache the wrong
+	 * initial range and don't revisit it later just because the driver
+	 * quietly called input_set_abs_params() again. Read the real range
+	 * from DT before registration instead, so it's right from the very
+	 * first enumeration; SET_PARAMETER below still applies on top if the
+	 * HAL later supplies its own values, same as before.
+	 */
+	rm->default_res_x = RM_INPUT_RESOLUTION_X;
+	rm->default_res_y = RM_INPUT_RESOLUTION_Y;
+	{
+		u32 val;
+
+		if (!device_property_read_u32(dev, "touchscreen-size-x", &val))
+			rm->default_res_x = (u16)val;
+		if (!device_property_read_u32(dev, "touchscreen-size-y", &val))
+			rm->default_res_y = (u16)val;
+	}
+	rm->invert_x = device_property_read_bool(dev, "touchscreen-inverted-x");
+	rm->invert_y = device_property_read_bool(dev, "touchscreen-inverted-y");
 	input_set_capability(rm->input, EV_ABS, ABS_PRESSURE);
-	input_set_abs_params(rm->input, ABS_MT_POSITION_X, 0, RM_INPUT_RESOLUTION_X - 1, 0, 0);
-	input_set_abs_params(rm->input, ABS_MT_POSITION_Y, 0, RM_INPUT_RESOLUTION_Y - 1, 0, 0);
+	rm31080_set_input_abs_range(rm, rm->default_res_x, rm->default_res_y);
 	input_set_abs_params(rm->input, ABS_MT_PRESSURE, 0, 0xFF, 0, 0);
 	input_set_abs_params(rm->input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX, 0, 0);
 	ret = input_mt_init_slots(rm->input, MAX_SLOT_AMOUNT, INPUT_MT_DIRECT);
@@ -2161,6 +2358,10 @@ static int rm31080_probe(struct spi_device *spi)
 		dev_err_probe(dev, ret, "misc_register failed\n");
 		goto err_wq;
 	}
+
+	rm->wakelock_init = wakeup_source_register(dev, "raydium_touch_wakelock");
+	if (!rm->wakelock_init)
+		dev_warn(dev, "wakeup_source_register failed, continuing without it\n");
 
 	/* Matches add_timer(&ts_timer_triggle) at the end of
 	 * rm_tch_spi_probe(): runs unconditionally for the life of the
@@ -2186,22 +2387,26 @@ static void rm31080_remove(struct spi_device *spi)
 	flush_workqueue(rm->wq);
 	destroy_workqueue(rm->wq);
 	misc_deregister(&rm->miscdev);
+	if (rm->wakelock_init)
+		wakeup_source_unregister(rm->wakelock_init);
 	if (rm->hal_pid)
 		put_pid(rm->hal_pid);
 	if (g_rm == rm)
 		g_rm = NULL;
 }
 
+#define TCH_WAKE_LOCK_TIMEOUT_MS	500	/* downstream: TCH_WAKE_LOCK_TIMEOUT (HZ/2) */
+
 /*
  * NOTE: suspend/resume below execute the KRL_INDEX_RM_SUSPEND /
  * KRL_INDEX_RM_RESUME tables directly, which is the correct mechanism
  * (this is exactly what those two table indices exist for) but the exact
  * surrounding bookkeeping downstream's rm_ctrl_suspend()/rm_ctrl_resume()
- * do around them (early-suspend interaction, wakelocks, IRQ
- * enable/disable ordering) hasn't been traced function-by-function the
- * way the rest of this driver has. Treat this PM path as the least
- * battle-tested part of the port and watch it closely across actual
- * suspend/resume cycles.
+ * do around them (early-suspend interaction, IRQ enable/disable ordering)
+ * hasn't been traced function-by-function the way the rest of this driver
+ * has. Treat this PM path as the least battle-tested part of the port and
+ * watch it closely across actual suspend/resume cycles. (The wakelock
+ * piece of that bookkeeping IS now ported -- see wakelock_init above.)
  */
 static int __maybe_unused rm31080_suspend(struct device *dev)
 {
@@ -2219,6 +2424,16 @@ static int __maybe_unused rm31080_resume(struct device *dev)
 	struct rm31080_data *rm = dev_get_drvdata(dev);
 
 	rm->is_suspended = false;
+	/* downstream: wake_lock_active()+wake_unlock() followed by
+	 * wake_lock_timeout() -- __pm_wakeup_event() is the direct modern
+	 * replacement for that exact "start or refresh a bounded wake
+	 * event" sequence in one call. Holds off suspend for
+	 * TCH_WAKE_LOCK_TIMEOUT_MS to give the reinit sequence below, and
+	 * whatever the HAL does after RM_SIGNAL_RESUME, room to complete;
+	 * released early by RM_IOCTL_INIT_END or
+	 * RM_VARIABLE_SET_WAKE_UNLOCK once that's confirmed done. */
+	if (rm->wakelock_init)
+		__pm_wakeup_event(rm->wakelock_init, TCH_WAKE_LOCK_TIMEOUT_MS);
 	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_RESUME]);
 	enable_irq(rm->irq);
 	rm31080_send_signal(rm, RM_SIGNAL_RESUME);

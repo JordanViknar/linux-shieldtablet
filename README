@@ -93,6 +93,8 @@ Drivers that are unique to this kernel port and not mainlined:
   mainline kernel.
   It does not decode touch data itself, and is not intended to be upstreamed.
   See `drivers/input/touchscreen/raydium-rm31080-spi-bridge.c`.
+  (Unlike the downstream driver, no separate Xorg configuration is required, and
+  this driver has been confirmed to work with Wayland as a result.)
 
 Quirks
 ------
