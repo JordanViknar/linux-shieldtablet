@@ -53,6 +53,7 @@ Partially functional:
   and then enable software renderer for applications that are too buggy.
   (Example: `GSK_RENDERER=cairo` for GTK apps)
 * Backlight: Can be turned on and off, but no further control.
+* HDMI: No audio, seems to crash the tablet if connected during startup.
 
 Configured, untested :
 
@@ -66,7 +67,6 @@ Non-functional / not worked on yet:
 
 * SD card reader
 * USB device and host
-* HDMI
 * GPS
 * Camera
 * Suspend

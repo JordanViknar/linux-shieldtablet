@@ -16,6 +16,7 @@
 
 	aliases {
 		mmc0 = &sdmmc4; /* eMMC */
+		/* uSD to implement */
 		mmc1 = &sdmmc1; /* WiFi */
 
 		rtc0 = &palmas;
@@ -25,7 +26,7 @@
 		serial1 = &uartc; /* Bluetooth */
 
 		serial2 = &uarta;
-		serial3 = &uartb;
+		serial3 = &uartb; /* GPS ? */
 	};
 
 	chosen {
@@ -37,6 +38,7 @@
 		reg = <0x0 0x80000000 0x0 0x80000000>;
 	};
 
+	/* UNFINISHED */
 	backlight: backlight {
 		compatible = "pwm-backlight"; // CONFIG_BACKLIGHT_PWM
 		pwms = <&pwm 1 40000>;
@@ -48,9 +50,20 @@
 		enable-gpios = <&gpio TEGRA_GPIO(H, 1) GPIO_ACTIVE_HIGH>;
 	};
 
-	// UNFINISHED
 	host1x@50000000 {
-		dsi: dsi@54300000 {
+		hdmi@54280000 {
+			status = "okay";
+
+			hdmi-supply = <&vdd_hdmi_5v0>;
+			pll-supply = <&vdd_hdmi_n5>;
+			vdd-supply = <&ldoln_reg>;
+
+			nvidia,ddc-i2c-bus = <&hdmi_ddc>;
+			nvidia,hpd-gpio = <&gpio TEGRA_GPIO(N, 7) GPIO_ACTIVE_HIGH>;
+		};
+
+		/* UNFINISHED */
+		dsi@54300000 {
 			status = "okay";
 
 			avdd-dsi-csi-supply = <&ldo5_reg>;
@@ -125,7 +138,7 @@
 		compatible = "nvidia,tegra124-hsuart"; // CONFIG_SERIAL_TEGRA
 	};
 
-	// UNKNOWN
+	/* Maybe the GPS ? */
 	uartb: serial@70006040 {
 		status = "okay";
 		compatible = "nvidia,tegra124-hsuart"; // CONFIG_SERIAL_TEGRA
@@ -142,12 +155,6 @@
 					   <9600 115200 200>,
 					   <1000000 4000000 136>;
 
-		/*
-			Will only function from a restart from downstream kernel for now.
-			
-			Note :
-			- Copy /system/etc/firmware/bcm43241.hcd into /lib/firmware/brcm/BCM4334B0.nvidia,shieldtablet.hcd in initramfs.
-		*/
 		bluetooth {
 			compatible = "brcm,bcm43241b0-bt", "brcm,bcm4334-bt"; // CONFIG_BT_HCIUART_BCM
 			max-speed = <4000000>;
@@ -168,7 +175,7 @@
 		};
 	};
 
-	// Console
+	/* Console */
 	uartd: serial@70006300 {
 		status = "okay";
 		compatible = "nvidia,tegra124-uart"; // CONFIG_SERIAL_8250_TEGRA
@@ -263,7 +270,6 @@
 			interrupts = <TEGRA_GPIO(J, 0) GPIO_ACTIVE_LOW>;
 
 			omit-battery-class;
-			// Add monitored-battery ?
 
 			battery_charger: charger {
 				regulator-name = "batt_regulator";
@@ -305,7 +311,8 @@
 		clock-frequency = <400000>;
 	};
 
-	i2c@7000c700 {
+	/* HDMI DDC */
+	hdmi_ddc: i2c@7000c700 {
 		status = "okay";
 		clock-frequency = <100000>;
 	};
@@ -626,14 +633,6 @@
 		vmmc-supply = <&palmas_smps9_reg>;
 		vqmmc-supply = <&palmas_smps8_reg>;
 
-		/*
-			Will only function from a restart from downstream kernel for now.
-			
-			Note :
-			- Copy `/system/vendor/firmware/bcm43241/fw_bcmdhd.bin` into `/lib/firmware/brcm/brcmfmac43241b0-sdio.nvidia,shieldtablet.bin` in initramfs.
-			- Copy `/data/misc/wifi/firmware/nvram.txt` into `/lib/firmware/brcm/brcmfmac43241b0-sdio.txt` in initramfs.
-			- clm_blob currently missing. Optional.
-		*/
 		wifi@1 {
 			compatible = "brcm,bcm43241b0-fmac", "brcm,bcm4329-fmac"; // CONFIG_BRCMFMAC_SDIO
 			reg = <1>;
@@ -644,7 +643,10 @@
 		};
 	};
 
+	/* uSD to be implemented */
+
 	/* eMMC */
+	/* UNFINISHED */
 	sdmmc4: mmc@700b0600 {
 		status = "okay";
 		bus-width = <8>;
