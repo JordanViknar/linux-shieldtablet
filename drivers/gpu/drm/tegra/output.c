@@ -6,6 +6,7 @@
 
 #include <linux/i2c.h>
 #include <linux/of.h>
+#include <linux/delay.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_edid.h>
@@ -49,6 +50,57 @@ int tegra_output_connector_get_modes(struct drm_connector *connector)
 	return err;
 }
 
+/*
+ * A raw HPD read is unreliable on its own: some sinks pulse HPD low
+ * briefly after a mode change, which looks identical to a real unplug
+ * to a simple level check. DDC is a stronger signal - the EDID/DDC
+ * bus only responds while a sink is actually present and wired up, so
+ * corroborate against it before believing a "disconnected" HPD read.
+ */
+static bool tegra_output_ddc_alive(struct tegra_output *output)
+{
+ 	u8 dummy;
+ 	struct i2c_msg msg = {
+ 		.addr = DDC_ADDR,
+ 		.flags = I2C_M_RD,
+ 		.len = 1,
+ 		.buf = &dummy,
+ 	};
+	bool last, cur;
+	int stable = 0;
+	unsigned long deadline;
+ 
+ 	if (!output->ddc)
+ 		return false;
+
+ 	/*
+ 	 * A single read can catch DDC mid-transition: on a real plug/
+ 	 * unplug the connector's pins don't all break/make contact at
+ 	 * once, so HPD and DDC can briefly disagree about the state.
+	 * Rather than guess how long that transition takes on any given
+	 * cable/monitor, sample until two consecutive reads agree. Some
+	 * sinks are known (see downstream nvidia driver's HPD_BOUNCE
+	 * EDID quirk table) to bounce HPD for as long as several
+	 * seconds, so the deadline below is a genuine "the bus is stuck,
+	 * stop looping" backstop, not a tuned wait - it's set well past
+	 * any real bounce duration on record.
+ 	 */
+	last = i2c_transfer(output->ddc, &msg, 1) == 1;
+	deadline = jiffies + msecs_to_jiffies(8000);
+
+	while (stable < 1 && time_before(jiffies, deadline)) {
+		usleep_range(2000, 3000);
+		cur = i2c_transfer(output->ddc, &msg, 1) == 1;
+		stable = (cur == last) ? stable + 1 : 0;
+		last = cur;
+	}
+
+	if (!time_before(jiffies, deadline))
+		dev_warn(output->dev, "DDC state did not settle, bus may be faulty\n");
+
+	return last;
+}
+
 enum drm_connector_status
 tegra_output_connector_detect(struct drm_connector *connector, bool force)
 {
@@ -56,7 +108,8 @@ tegra_output_connector_detect(struct drm_connector *connector, bool force)
 	enum drm_connector_status status = connector_status_unknown;
 
 	if (output->hpd_gpio) {
-		if (gpiod_get_value(output->hpd_gpio) == 0)
+		if (gpiod_get_value(output->hpd_gpio) == 0 &&
+			!tegra_output_ddc_alive(output))
 			status = connector_status_disconnected;
 		else
 			status = connector_status_connected;

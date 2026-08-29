@@ -53,9 +53,9 @@ Partially functional:
   and then enable software renderer for applications that are too buggy.
   (Example: `GSK_RENDERER=cairo` for GTK apps)
 * Backlight: Can be turned on and off, but no further control.
-* HDMI: Audio works sometimes. Seems to crash the tablet if connected in some
-  situations (framebuffer usage, display switching in some cases ?). CEC not
-  configured yet.
+* HDMI: Audio is fully functional, but HDMI in general is unstable.
+  It can crash the tablet if connected in some situations (framebuffer usage,
+  some monitor setups ?).
 
 Configured, untested :
 
@@ -64,6 +64,7 @@ Configured, untested :
 * Thermal zones
 * External microphone connected through jack
 * Hardware keys (stylus pen detection)
+* HDMI CEC
 
 Non-functional / not worked on yet:
 
@@ -95,7 +96,7 @@ Drivers that are unique to this kernel port and not mainlined:
   mainline kernel.
   It does not decode touch data itself, and is not intended to be upstreamed.
   See `drivers/input/touchscreen/raydium-rm31080-spi-bridge.c`.
-  (Unlike the downstream driver, no separate Xorg configuration is required, and
+  (Unlike the L4T port driver, no separate Xorg configuration is required, and
   this driver has been confirmed to work with Wayland as a result.)
 
 Quirks
@@ -139,6 +140,20 @@ Implementation Notes
   UCM presents them as separate profiles rather than switchable ports.
   WirePlumber's `auto-profile` rule provides automatic switching.
   This seems to be an upstream rt5640 UCM limitation also affecting other devices.
+* HDMI Audio: The HPD GPIO backing the HDMI connector has no hardware
+  debounce, and some sinks briefly pulse HPD low after a mode
+  change/resync. `tegra_hdmi_connector_detect()` cleared
+  `HDMI_NV_PDISP_SOR_AUDIO_HDA_PRESENSE` on any such blip with no way to
+  restore it short of a full encoder disable/enable, so audio could
+  break until a lucky reconnect (video was unaffected, since it doesn't
+  use this register). Fixed by corroborating HPD against the DDC bus in
+  `tegra_output_connector_detect()`, since DDC only responds while a
+  sink is genuinely present; `tegra_output_ddc_alive()` waits for
+  consecutive reads to agree, since connector pins don't all make/break
+  contact at once. A sturdier version would compare sink identity
+  across the debounce window instead, closer to `amdgpu_dm`'s handling
+  of the same problem.
+  See `drivers/gpu/drm/tegra/output.c`.
 * Memory controller: Couldn't get some of the downstream kernel's values to
   work on mainline. Using the values from Aaron Kling's `tegra124-ardbeg-emc.dtsi`
   seems to be stable enough for booting and running the system for now.
