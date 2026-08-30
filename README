@@ -31,6 +31,7 @@ Fully functional:
 * Power monitor (using `ina3221`)
 * Thermal sensors (using `tegra_soctherm` & `generic_adc_thermal`)
 * DRM (`tegradrm` & `simpledrm`)
+* Backlight (any choppiness is not kernel-related)
 
 Fully functional, with quirks:
 
@@ -52,7 +53,6 @@ Partially functional:
   Personally, I have `MESA_LOADER_DRIVER_OVERRIDE=tegra` in `/etc/environment`
   and then enable software renderer for applications that are too buggy.
   (Example: `GSK_RENDERER=cairo` for GTK apps)
-* Backlight: Can be turned on and off, but no further control.
 * HDMI: Audio is fully functional, but HDMI in general is unstable.
   It can crash the tablet if connected in some situations (framebuffer usage,
   some monitor setups ?).
