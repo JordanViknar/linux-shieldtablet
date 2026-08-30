@@ -12,6 +12,7 @@ dtb-$(CONFIG_ARCH_TEGRA_124_SOC) += \
 	tegra124-nyan-big-fhd.dtb \
 	tegra124-nyan-blaze.dtb \
     tegra124-nvidia-shieldtablet-l.dtb \
+	tegra124-nvidia-shieldtablet-m.dtb \
 	tegra124-venice2.dtb \
 	tegra124-xiaomi-mocha.dtb
 dtb-$(CONFIG_ARCH_TEGRA_2x_SOC) += \

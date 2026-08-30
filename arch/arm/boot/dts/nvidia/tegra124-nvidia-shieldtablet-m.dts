@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+
+#include "tegra124-nvidia-shieldtablet.dtsi"
+
+/*
+ * Essentially an untested placeholder. Don't expect this to work.
+ */
+
+/ {
+	model = "NVIDIA SHIELD Tablet (Android M/N)";
+	// "nvidia,shieldtablet" goes first to keep the same Wi-Fi/Bluetooth firmware blob naming.
+	compatible = "nvidia,shieldtablet", "nvidia,shieldtablet-m", "nvidia,tegra124";
+
+	chosen {
+		/*
+		 * Note : Configure initramfs (if there even is one) and 
+		 * framebuffer for Android M/N
+		 */
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		// Note : configure Android M/N reserved memory areas
+	};
+
+	/* I have yet to check properly but I believe NVIDIA fixed their mess */
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+	
+	cpus {
+		cpu0: cpu@0 {
+			enable-method = "psci";
+		};
+
+		cpu1: cpu@1 {
+			enable-method = "psci";
+		};
+
+		cpu2: cpu@2 {
+			enable-method = "psci";
+		};
+
+		cpu3: cpu@3 {
+			enable-method = "psci";
+		};
+	};
+};

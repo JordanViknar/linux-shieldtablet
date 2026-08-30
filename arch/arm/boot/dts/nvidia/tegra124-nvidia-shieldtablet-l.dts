@@ -8,11 +8,9 @@
  */
 
 / {
-	model = "NVIDIA SHIELD Tablet (Android 5.0/L)";
+	model = "NVIDIA SHIELD Tablet (Android L)";
 	// "nvidia,shieldtablet" goes first to keep the same Wi-Fi/Bluetooth firmware blob naming.
 	compatible = "nvidia,shieldtablet", "nvidia,shieldtablet-l", "nvidia,tegra124";
-
-	// --- Initramfs ---
 
 	/* At least this bootloader allows an initramfs but... damn it NVIDIA ! */
 	chosen {
@@ -29,8 +27,6 @@
 		};
 	};
 
-	// --- Memory ---
-
 	/* Another NVIDIA moment */
 	reserved-memory {
 		#address-cells = <2>;
@@ -40,6 +36,17 @@
 		bootloader_fb: bootloader-framebuffer@ad012000 {
 			reg = <0x0 0xad012000 0x0 0x011e0000>;
 			no-map;
+		};
+
+		ramoops: ramoops@f7a00000 {
+			compatible = "ramoops";
+			reg = <0x0 0xf7a00000 0x0 0x00200000>; /* 2MB */
+			console-size = <0x00100000>; /* 1MB   */
+			ftrace-size  = <0x00100000>; /* 1MB   */
+			/* no record-size: matches downstream, which leaves this
+			* at 0 (dedicated oops-record zone disabled); mainline's
+			* ramoops defaults an absent record-size to 0 too, via
+			* parse_u32("record-size", pdata->record_size, 0) */
 		};
 
 		framebuffer: framebuffer@f7c00000 {
@@ -52,16 +59,30 @@
 			no-map;
 		};
 
+		nvdumper: nvdumper@fd600000 {
+			reg = <0x0 0xfd600000 0x0 0x00001000>;
+			no-map;
+		};
+
 		nck: nck@fd700000 {
 			reg = <0x0 0xfd700000 0x0 0x00100000>;
 			no-map;
 		};
 
 		/*
-		 * I was unable to remove this area without causing a crash,
-		 * despite it not getting mentioned by the downstream kernel.
+		 * Downstream boots with `mem=2006M@2048M` on the
+		 * cmdline, which caps usable RAM at exactly 0xfd600000 even
+		 * though the chip has a full 2048M (up to 0x100000000).
+		 * That leaves exactly 42M unusable at the top of RAM --
+		 * nvdumper + nck + this region + lp0 + tsec below tile that
+		 * 42M exactly, with no gaps or overlaps. We have no `mem=`
+		 * cmdline restriction, so unlike downstream we rely entirely
+		 * on these no-map entries to keep Linux out of it. It's
+		 * almost certainly TrustZone/secure-firmware or LP0-warmboot
+		 * owned RAM, unsafe to hand out as ordinary DRAM, but which
+		 * of those (or something else) hasn't been confirmed.
 		 */
-		would_be_freed_fd800000: would-be-freed@fd800000 {
+		firmware_reserved_fd800000: firmware-reserved@fd800000 {
 			reg = <0x0 0xfd800000 0x0 0x007f0000>;
 			no-map;
 		};
@@ -77,16 +98,6 @@
 		};
 	};
 
-	// --- CPU ---
-
-	psci {
-		compatible = "arm,psci";
-		method = "smc";
-		cpu_suspend = <0x84000001>;
-		cpu_off = <0x84000002>; // This one isn't mentioned by downstream
-		cpu_on = <0x84000003>;
-	};
-
 	/*
 	 * A `psci` node is present in this file even though PSCI is NOT used to
 	 * power on CPU1-3 - on this board's (Android L) bootloader, PSCI CPU_ON
@@ -96,22 +107,10 @@
 	 * targeting CPU0 (already running) rather than the CPUs actually being
 	 * booted. Actual CPU1-3 bring-up happens directly via PMC instead.
 	 */
-	cpus {
-		cpu0: cpu@0 {
-			vdd-cpu-supply = <&vdd_cpu>;
-			#cooling-cells = <2>;
-		};
-
-		cpu1: cpu@1 {
-			#cooling-cells = <2>;
-		};
-
-		cpu2: cpu@2 {
-			#cooling-cells = <2>;
-		};
-
-		cpu3: cpu@3 {
-			#cooling-cells = <2>;
-		};
+	psci {
+		compatible = "arm,psci";
+		method = "smc";
+		cpu_suspend = <0x84000001>;
+		cpu_on = <0x84000003>;
 	};
 };

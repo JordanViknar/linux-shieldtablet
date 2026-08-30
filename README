@@ -45,8 +45,6 @@ Partially functional:
 * Display: Minor instabilities (strange coloring) found under high system load.
   Can on rare occasion crash on startup with a screen whiteout effect, I suggest
   quickly emergency rebooting with the power button should this happens.
-* Memory controller: Values potentially slightly off compared to downstream,
-  might be the actual reason for display instability.
 * GPU (using `nouveau`): Pretty unstable, works only with a patch to Mesa :
   https://github.com/JordanViknar/mesa-tegra/tree/tegra-fixes
   Xorg seems to have major issues, Wayland works a bit better.
@@ -154,10 +152,6 @@ Implementation Notes
   across the debounce window instead, closer to `amdgpu_dm`'s handling
   of the same problem.
   See `drivers/gpu/drm/tegra/output.c`.
-* Memory controller: Couldn't get some of the downstream kernel's values to
-  work on mainline. Using the values from Aaron Kling's `tegra124-ardbeg-emc.dtsi`
-  seems to be stable enough for booting and running the system for now.
-  See `arch/arm/boot/dts/nvidia/tegra124-shieldtablet-emc.dtsi`.
 * SMP: On the Android L bootloader (may not be exclusive to it), PSCI CPU_ON
   claims success but never actually powers on CPU1-3. Worked around by using
   a PSCI CPU_ON call on CPU0 (already running) purely to register the reset
@@ -194,7 +188,7 @@ Previous mainline ports:
   https://github.com/winsock/linux/tree/st8
 * Aaron Kling, for his more recent partial device trees for the NVIDIA SHIELD Tablet:
   https://gitlab.incom.co/CM-Shield/android_hardware_nvidia_t124_lineage/-/blob/lineage-24.0/tegra124-tn8.dts
-  and Ardberg:
+  and Ardbeg:
   https://gitlab.incom.co/CM-Shield/android_hardware_nvidia_t124_lineage/-/blob/lineage-24.0/tegra124-ardbeg.dts
 
 Other mainline ports:
