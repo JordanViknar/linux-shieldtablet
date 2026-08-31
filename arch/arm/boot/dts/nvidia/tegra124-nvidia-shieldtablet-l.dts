@@ -3,16 +3,11 @@
 
 #include "tegra124-nvidia-shieldtablet.dtsi"
 
-/*
- * This file can be essentially summarized as "Damn it NVIDIA !"
- */
-
 / {
 	model = "NVIDIA SHIELD Tablet (Android L)";
 	// "nvidia,shieldtablet" goes first to keep the same Wi-Fi/Bluetooth firmware blob naming.
 	compatible = "nvidia,shieldtablet", "nvidia,shieldtablet-l", "nvidia,tegra124";
 
-	/* At least this bootloader allows an initramfs but... damn it NVIDIA ! */
 	chosen {
 		bootargs = "panic=15 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:1,commit=120,discard=async,noatime,nodiratime";
 
@@ -29,7 +24,6 @@
 		};
 	};
 
-	/* Another NVIDIA moment */
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -40,52 +34,18 @@
 			no-map;
 		};
 
-		ramoops: ramoops@f7a00000 {
-			compatible = "ramoops";
-			reg = <0x0 0xf7a00000 0x0 0x00200000>; /* 2MB */
-			console-size = <0x00100000>; /* 1MB   */
-			ftrace-size  = <0x00100000>; /* 1MB   */
-			/* no record-size: matches downstream, which leaves this
-			* at 0 (dedicated oops-record zone disabled); mainline's
-			* ramoops defaults an absent record-size to 0 too, via
-			* parse_u32("record-size", pdata->record_size, 0) */
-		};
-
-		framebuffer: framebuffer@f7c00000 {
-			reg = <0x0 0xf7c00000 0x0 0x01200000>;
-			no-map;
-		};
-
-		framebuffer2: framebuffer2@f8e00000 {
-			reg = <0x0 0xf8e00000 0x0 0x04800000>;
-			no-map;
-		};
-
 		nvdumper: nvdumper@fd600000 {
 			reg = <0x0 0xfd600000 0x0 0x00001000>;
 			no-map;
 		};
 
-		nck: nck@fd700000 {
+		/* nck@fd700000 {
 			reg = <0x0 0xfd700000 0x0 0x00100000>;
 			no-map;
-		};
+		}; */
 
-		/*
-		 * Downstream boots with `mem=2006M@2048M` on the
-		 * cmdline, which caps usable RAM at exactly 0xfd600000 even
-		 * though the chip has a full 2048M (up to 0x100000000).
-		 * That leaves exactly 42M unusable at the top of RAM --
-		 * nvdumper + nck + this region + lp0 + tsec below tile that
-		 * 42M exactly, with no gaps or overlaps. We have no `mem=`
-		 * cmdline restriction, so unlike downstream we rely entirely
-		 * on these no-map entries to keep Linux out of it. It's
-		 * almost certainly TrustZone/secure-firmware or LP0-warmboot
-		 * owned RAM, unsafe to hand out as ordinary DRAM, but which
-		 * of those (or something else) hasn't been confirmed.
-		 */
-		firmware_reserved_fd800000: firmware-reserved@fd800000 {
-			reg = <0x0 0xfd800000 0x0 0x007f0000>;
+		tzram: tzram@fda00000 {
+			reg = <0x0 0xfda00000 0x0 0x00400000>;
 			no-map;
 		};
 

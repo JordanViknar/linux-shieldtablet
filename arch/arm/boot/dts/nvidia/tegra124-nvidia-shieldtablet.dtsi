@@ -188,6 +188,7 @@
 	};
 
 	/* Bluetooth */
+	/* UNFINISHED */
 	uartc: serial@70006200 {
 		compatible = "nvidia,tegra124-hsuart", "nvidia,tegra30-hsuart"; // CONFIG_SERIAL_TEGRA
 		reset-names = "serial";
@@ -539,6 +540,7 @@
 						//regulator-max-microvolt = <1050000>;
 						regulator-always-on;
 						regulator-boot-on;
+						// vin-supply = <&palmas_smps6_reg>;
 					};
 
 					/* LCD AVDD / touch analogue (LDO2, 3.3V) */
@@ -663,6 +665,7 @@
 	};
 
 	/* Wi-Fi */
+	/* UNFINISHED */
 	sdmmc1: mmc@700b0000 {
 		status = "okay";
 
