@@ -31,7 +31,6 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "panic=15 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:1,commit=120,discard=async,noatime,nodiratime";
 	};
 
 	memory@80000000 {
@@ -787,6 +786,16 @@
 			linux,code = <KEY_VOLUMEUP>;
 			debounce-interval = <10>;
 		};
+
+		/*
+		 * The SHIELD Tablet has no such button, but
+		 * the downstream DTS has it configured ?
+		 */
+		/*camera-focus {
+			label = "Camera Focus";
+			gpios = <&gpio TEGRA_GPIO(Q, 2) GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_CAMERA_FOCUS>;
+		};*/
 	};
 
 	cec@70015000 {

@@ -14,6 +14,8 @@
 
 	/* At least this bootloader allows an initramfs but... damn it NVIDIA ! */
 	chosen {
+		bootargs = "panic=15 gpt clk_ignore_unused root=/dev/mmcblk0p23 rw rootwait rootflags=defaults,noatime,nodiratime loop=media/0/Linux/linux.img loopflags=subvol=/pmos,compress=zstd:1,commit=120,discard=async,noatime,nodiratime";
+
 		linux,initrd-start = <0x81680000>;
 		linux,initrd-end = <0x82800000>;
 

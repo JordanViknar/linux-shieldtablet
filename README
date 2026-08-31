@@ -25,13 +25,14 @@ Fully functional:
 
 * All CPU cores
 * Internal eMMC
-* Hardware keys (volume up, volume down, power, lid switch)
 * Fuel gauge (using custom driver `lc709203f`)
 * Charger (using `bq24193`)
 * Power monitor (using `ina3221`)
 * Thermal sensors (using `tegra_soctherm` & `generic_adc_thermal`)
 * DRM (`tegradrm` & `simpledrm`)
 * Backlight (any choppiness is not kernel-related)
+* Accelerometer + gyroscope (using `inv-mpu6050-i2c`)
+* Magnetometer (using `ak8975`)
 
 Fully functional, with quirks:
 
@@ -39,6 +40,10 @@ Fully functional, with quirks:
 * Bluetooth (using `hci_bcm`)
 * Wi-Fi (using `brcmfmac`)
 * Touchscreen (using custom driver `raydium-rm31080-spi-bridge`)
+* Hardware keys: "Power", "Volume Up", "Volume Down", "Lid Switch" function
+  perfectly. "Tablet Mode" (Stylus Pen Detect) is untested, as the K1 model
+  doesn't have it. "Camera Focus" is configured by downstream, but seems to be an
+  oddity.
 
 Partially functional:
 
@@ -48,20 +53,17 @@ Partially functional:
 * GPU (using `nouveau`): Pretty unstable, works only with a patch to Mesa :
   https://github.com/JordanViknar/mesa-tegra/tree/tegra-fixes
   Xorg seems to have major issues, Wayland works a bit better.
-  Personally, I have `MESA_LOADER_DRIVER_OVERRIDE=tegra` in `/etc/environment`
-  and then enable software renderer for applications that are too buggy.
+  Personally, I have `MESA_LOADER_DRIVER_OVERRIDE=tegra` in `/etc/environment` and
+  then enable software renderer for applications that are too buggy.
   (Example: `GSK_RENDERER=cairo` for GTK apps)
 * HDMI: Audio is fully functional, but HDMI in general is unstable.
-  It can crash the tablet if connected in some situations (framebuffer usage,
-  some monitor setups ?).
+  It can crash the tablet if connected in some situations (framebuffer usage, some
+  monitor setups ?).
 
 Configured, untested :
 
-* Accelerometer + gyroscope (using `inv-mpu6050-i2c`)
-* Magnetometer (using `ak8975`)
 * Thermal zones
 * External microphone connected through jack
-* Hardware keys (stylus pen detection)
 * HDMI CEC
 
 Non-functional / not worked on yet:
