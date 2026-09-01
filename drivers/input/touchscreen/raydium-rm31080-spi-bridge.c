@@ -582,6 +582,19 @@ struct rm31080_data {
 	u16 read_para;		/* g_st_ts.u16_read_para: written by
 				 * KRL_CMD_RETURN_RESULT/RETURN_VALUE, read by
 				 * rm31080_wait_for_scan_finish(). */
+
+	/*
+	 * Downstream's u8_resume_cnt: gates SET_SPI_UNLOCK against
+	 * a race condition where multiple system-resume signals might be
+	 * outstanding simultaneously. Incremented once per resume event
+	 * (in rm31080_resume()). Decremented twice: once in INIT_END
+	 * ("In case issued by boot-up") and once on each call to
+	 * RM_VARIABLE_CHECK_SPI_LOCK's GET_VARIABLE handler (the polling
+	 * site where userspace checks lock status). SET_SPI_UNLOCK only
+	 * unlocks if resume_cnt == 1, deferring the unlock until all
+	 * outstanding resumes have been serviced.
+	 */
+	u8 resume_cnt;
 };
 
 /* Only one touch chip in the system; the KRL interpreter and a couple of
@@ -1247,6 +1260,31 @@ static void rm31080_wait_for_scan_finish(struct rm31080_data *rm)
 }
 
 /*
+ * rm_tch_ctrl_wait_for_scan_finish(0): genuinely different from the
+ * u8Idx=1 variant above, NOT just a stylistic alternative -- with
+ * u8Idx=0, downstream re-runs the WAITSCANOK table and sleeps 1-2ms
+ * between checks, up to 50 times (~100ms total), stopping as soon as the
+ * scan-busy bit (read_para bit 0, set by the table's own
+ * KRL_CMD_RETURN_RESULT/RETURN_VALUE opcode) clears -- an actual
+ * polling wait, unlike u8Idx=1's single check-and-return. Used by
+ * suspend (both call sites in rm_ctrl_suspend()) to make sure any
+ * in-flight scan has genuinely finished before the chip is reconfigured
+ * for suspend / powered down.
+ */
+static void rm31080_wait_for_scan_finish_blocking(struct rm31080_data *rm)
+{
+	int i;
+
+	for (i = 0; i < 50; i++) {
+		rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_WAITSCANOK]);
+		if (rm->read_para & 0x01)
+			usleep_range(1000, 2000);
+		else
+			break;
+	}
+}
+
+/*
  * rm_tch_ctrl_scan_start(): replaces the bare SCANSTART call when
  * frequency hopping is enabled. Note the exact ordering downstream uses,
  * preserved here rather than "simplified": ns_sel is latched from the
@@ -1623,14 +1661,28 @@ static void rm31080_watchdog_request(struct rm31080_data *rm)
 }
 
 /*
- * RM_VARIABLE_WATCHDOG_FLAG (SET_VARIABLE): ported from
- * rm_ctrl_watchdog_func(). arg bit 0 = enable, arg >> 16 = watchdog period
- * in (downsampled) ticks. Disabling sets the period to "never".
+ * Exact port of rm_ctrl_watchdog_func(): arg bit 0 = enable, arg >> 16 =
+ * watchdog period in (downsampled) ticks. Disabling sets the period to
+ * "never". Split out from rm31080_watchdog_configure() below because
+ * downstream calls this SAME function from two different places with two
+ * different intents -- the SET_VARIABLE(WATCHDOG_FLAG) path (which also
+ * has a second, unrelated side effect on ns_func_enable -- see below) and
+ * rm_tch_init_ts_structure_part()'s unconditional arg=0 reset on every
+ * resume (which must NOT touch ns_func_enable, since that's an
+ * independently-HAL-configured feature that shouldn't silently reset
+ * itself every time the system wakes up).
+ *
+ * NOTE: this previously did not reset watchdog_check, unlike downstream's
+ * b_watch_dog_check = 0 -- found while cross-checking against the real
+ * downstream source for the suspend/resume audit below. Fixed here; low
+ * risk since it only ever mattered as a stale flag left over from a prior
+ * watchdog cycle, and this reset already runs on every (re)configure.
  */
-static void rm31080_watchdog_configure(struct rm31080_data *rm, unsigned long arg)
+static void rm31080_watchdog_reset(struct rm31080_data *rm, unsigned long arg)
 {
 	rm->watchdog_flg = false;
 	rm->watchdog_cnt = 0;
+	rm->watchdog_check = false;
 
 	if (arg & 0x01) {
 		rm->watchdog_enable = true;
@@ -1639,6 +1691,17 @@ static void rm31080_watchdog_configure(struct rm31080_data *rm, unsigned long ar
 		rm->watchdog_enable = false;
 		rm->watchdog_time = 0xFFFFFFFF;
 	}
+}
+
+/*
+ * RM_VARIABLE_WATCHDOG_FLAG (SET_VARIABLE): ported from
+ * rm_ctrl_watchdog_func() plus the ns_func_enable side effect that
+ * downstream's SET_VARIABLE(WATCHDOG_FLAG) case layers on top of it
+ * immediately afterward (see rm31080_watchdog_reset()'s comment).
+ */
+static void rm31080_watchdog_configure(struct rm31080_data *rm, unsigned long arg)
+{
+	rm31080_watchdog_reset(rm, arg);
 
 	/* Same packed arg also carries u8_ns_func_enable in bits 6-7 of its
 	 * low byte downstream (g_st_ctrl.u8_ns_func_enable is a single
@@ -1771,6 +1834,12 @@ static u32 rm31080_get_variable(struct rm31080_data *rm, unsigned int index, u8 
 		break;
 	case RM_VARIABLE_CHECK_SPI_LOCK:
 		val = rm->spi_locked | rm->is_suspended;
+		/* Downstream's rm_tch_get_spi_lock_status(): decrement resume_cnt
+		 * here, at the polling site where userspace checks lock status.
+		 * Only decrement if spi_locked is true (the condition downstream
+		 * also checks). */
+		if (rm->spi_locked && rm->resume_cnt)
+			rm->resume_cnt--;
 		break;
 	default:
 		dev_dbg(&rm->spi->dev, "GET_VARIABLE: unhandled index=%u\n", index);
@@ -1800,7 +1869,18 @@ static void rm31080_set_variable(struct rm31080_data *rm, unsigned int index, un
 		rm31080_watchdog_configure(rm, arg);
 		break;
 	case RM_VARIABLE_SET_SPI_UNLOCK:
+		/* Downstream: skip unlock if resume_cnt > 1 (another resume
+		 * is still pending). Defer to the next polling cycle of
+		 * RM_VARIABLE_CHECK_SPI_LOCK, which will decrement and
+		 * eventually permit the unlock when resume_cnt reaches 1. */
+		if (rm->resume_cnt > 1) {
+			dev_dbg(&rm->spi->dev,
+				"SET_SPI_UNLOCK: deferring (resume_cnt=%u > 1)\n",
+				rm->resume_cnt);
+			break;
+		}
 		rm->spi_locked = false;
+		dev_dbg(&rm->spi->dev, "SET_SPI_UNLOCK: spi_locked=false\n");
 		break;
 	case RM_VARIABLE_REPEAT:
 		/* downstream also stores this into a general-purpose
@@ -2001,9 +2081,12 @@ static long rm31080_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 	case RM_IOCTL_INIT_END:
 		rm->init_finished = true;
 		rm->calc_finished = true;
+		if (rm->resume_cnt)
+			rm->resume_cnt--;
 		if (rm->wakelock_init)
 			__pm_relax(rm->wakelock_init);
-		dev_dbg(&rm->spi->dev, "INIT_END: init_finished=true, calc_finished=true\n");
+		dev_dbg(&rm->spi->dev, "INIT_END: init_finished=true, calc_finished=true, resume_cnt=%u\n",
+			rm->resume_cnt);
 		break;
 	case RM_IOCTL_SCRIBER_CTRL:
 		/* NOTE: scriber (palm-rejection style) mode flag; stored but
@@ -2210,24 +2293,33 @@ static int rm31080_probe(struct spi_device *spi)
 	if (IS_ERR(rm->gpio_dvdd))
 		return dev_err_probe(dev, PTR_ERR(rm->gpio_dvdd), "failed to get dvdd gpio\n");
 
-	rm->clk = devm_clk_get(dev, NULL);
+	/* devm_clk_get_optional_enabled(): optional (matches downstream's
+	 * defensive "if (ts && ts->clk)" checks around every other use of
+	 * this clock -- this board's DTS always defines it, but other
+	 * RM31080 boards may not) AND auto-prepares+enables now, with
+	 * devm automatically disabling+unpreparing on remove(). Plain
+	 * devm_clk_get() only manages the handle, not the enable state --
+	 * the prior code called clk_prepare_enable() in probe with no
+	 * matching disable anywhere in remove(), leaking the enable
+	 * refcount on every unbind. */
+	rm->clk = devm_clk_get_optional_enabled(dev, NULL);
 	if (IS_ERR(rm->clk))
 		return dev_err_probe(dev, PTR_ERR(rm->clk), "failed to get touch clock\n");
 
-	/* Power/clock/reset sequence ported from rm_tch_spi_probe(): supplies
-	 * up, brief settle, hold reset low 120ms, release, settle 20ms. The
-	 * exact same numbers dmesg shows the downstream driver using. */
-	ret = regulator_enable(rm->avdd);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to enable avdd\n");
+	/* Power/clock/reset sequence ported from rm_tch_spi_probe(): 1.8V
+	 * (dvdd) enabled first, settle, THEN 3.3V (avdd) -- downstream's own
+	 * comments say "Enable 1v8 first" / "Enable 3v3 then", in that
+	 * order, with the settle delay between them, not after both. Then
+	 * hold reset low 120ms, release, settle 20ms. The reset timing is
+	 * the exact same numbers dmesg shows the downstream driver using. */
 	ret = regulator_enable(rm->dvdd);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to enable dvdd\n");
-	ret = clk_prepare_enable(rm->clk);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to enable touch clock\n");
-
 	usleep_range(5000, 6000);
+	ret = regulator_enable(rm->avdd);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to enable avdd\n");
+
 	gpiod_set_value_cansleep(rm->gpio_reset, 1); /* assert (already asserted; explicit for clarity/timing) */
 	msleep(120);
 	gpiod_set_value_cansleep(rm->gpio_reset, 0); /* release */
@@ -2391,6 +2483,18 @@ static void rm31080_remove(struct spi_device *spi)
 		wakeup_source_unregister(rm->wakelock_init);
 	if (rm->hal_pid)
 		put_pid(rm->hal_pid);
+	/* rm_tch_spi_remove(): regulator_disable() in the same order
+	 * downstream does it, avdd (3v3) then dvdd (1v8) -- reverse of the
+	 * dvdd-then-avdd enable order in probe. These are plain
+	 * devm_regulator_get() handles (not the *_enable variant), because
+	 * krl_config_3v3()/krl_config_1v8() above also toggle them at
+	 * runtime via KRL bytecode, so devm can't auto-manage the enable
+	 * state the way it does for the clock below. Unlike downstream's
+	 * kzalloc+goto probe, a failed regulator_enable() in our probe
+	 * returns early via dev_err_probe() before remove() could ever be
+	 * reached with an invalid handle, so no extra guard is needed here. */
+	regulator_disable(rm->avdd);
+	regulator_disable(rm->dvdd);
 	if (g_rm == rm)
 		g_rm = NULL;
 }
@@ -2398,23 +2502,93 @@ static void rm31080_remove(struct spi_device *spi)
 #define TCH_WAKE_LOCK_TIMEOUT_MS	500	/* downstream: TCH_WAKE_LOCK_TIMEOUT (HZ/2) */
 
 /*
- * NOTE: suspend/resume below execute the KRL_INDEX_RM_SUSPEND /
- * KRL_INDEX_RM_RESUME tables directly, which is the correct mechanism
- * (this is exactly what those two table indices exist for) but the exact
- * surrounding bookkeeping downstream's rm_ctrl_suspend()/rm_ctrl_resume()
- * do around them (early-suspend interaction, IRQ enable/disable ordering)
- * hasn't been traced function-by-function the way the rest of this driver
- * has. Treat this PM path as the least battle-tested part of the port and
- * watch it closely across actual suspend/resume cycles. (The wakelock
- * piece of that bookkeeping IS now ported -- see wakelock_init above.)
+ * Releases every MT slot (Type B) as "not touching" and syncs. Downstream:
+ * the INPUT_PROTOCOL_TYPE_B block at the end of rm_ctrl_suspend() -- same
+ * loop shape as the no-touch-count-transition case in
+ * rm31080_report_pointer() above, but that copy is left alone (rather than
+ * factored into a shared helper called from both places) so this
+ * suspend-path addition can't perturb the already hardware-verified
+ * touch-reporting path.
+ */
+static void rm31080_release_all_touches(struct rm31080_data *rm)
+{
+	int i;
+
+	for (i = 0; i < MAX_SLOT_AMOUNT; i++) {
+		input_mt_slot(rm->input, i);
+		input_mt_report_slot_state(rm->input, MT_TOOL_FINGER, false);
+		input_report_key(rm->input, BTN_TOOL_RUBBER, false);
+	}
+	input_sync(rm->input);
+	rm->last_touch_count = 0;
+}
+
+/*
+ * Below is a full function-by-function port of rm_ctrl_suspend() /
+ * rm_ctrl_resume() / rm_tch_init_ts_structure_part() against the real
+ * downstream source (previously flagged as "least battle-tested part of
+ * the port" -- not just the wakelock piece, but not yet traced either).
+ * Deliberately NOT ported, with reasons:
+ *   - early_suspend (CONFIG_HAS_EARLYSUSPEND) and the input_dev
+ *     enable()/disable() Android-powerHAL hooks (rm_tch_input_enable/
+ *     _disable): both alternate entry points into rm_tch_suspend/resume()
+ *     alongside the standard dev_pm_ops path. Neither exists on a mainline
+ *     non-Android target -- early_suspend was removed from mainline years
+ *     ago, and there's no powerHAL here. SIMPLE_DEV_PM_OPS below is our
+ *     only entry point, same as downstream's rm_dev_pm_suspend/_resume.
+ *   - The IRQ-poster kthread stop/start (ISR_POST_HANDLER==KTHREAD) and
+ *     event-queue thread stop (ENABLE_EVENT_QUEUE): different ISR
+ *     backends we don't share -- we use a plain threaded IRQ + workqueue,
+ *     for which disable_irq()/enable_irq() around the whole sequence is
+ *     the direct equivalent of "stop new work from starting".
+ *   - g_pu8_burstread_buf / g_worker_queue_is_flush / g_timer_queue_is_flush
+ *     resets inside rm_tch_init_ts_structure_part(): internal bookkeeping
+ *     for downstream's own buffer/queue-flush tracking, which doesn't map
+ *     onto our queue/q_front/q_rear ring-buffer design.
+ *   - u8_test_mode_type, b_is_disabled: diagnostics/powerHAL fields with
+ *     no functional consumer anywhere else in this port either (same
+ *     boundary as the existing RM_IOCTL_SCRIBER_CTRL NOTE).
  */
 static int __maybe_unused rm31080_suspend(struct device *dev)
 {
 	struct rm31080_data *rm = dev_get_drvdata(dev);
 
+	/* rm_ctrl_suspend(): "if (b_is_suspended == true) return;" -- our
+	 * single dev_pm_ops entry point doesn't have downstream's triple
+	 * entry-path re-entrancy risk, but the guard is cheap and keeps
+	 * disable_irq() balanced against a duplicate call. */
+	if (rm->is_suspended)
+		return 0;
+
 	disable_irq(rm->irq);
-	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_SUSPEND]);
+
 	rm->is_suspended = true;
+	rm->init_finished = false;	/* b_init_finish = 0 */
+
+	mutex_lock(&rm->scan_mode_lock);
+	if (rm->scan_mode_state == RM_SCAN_IDLE_MODE)
+		rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_FUNC_PAUSE_AUTO]);
+	mutex_unlock(&rm->scan_mode_lock);
+
+	/* Two distinct wait-for-scan-finish calls at two distinct points,
+	 * matching rm_ctrl_suspend() exactly: once before touching the
+	 * suspend table at all (let anything already in flight finish),
+	 * and once between the table's two cases (case 0 stops scanning;
+	 * case 1 is presumably the actual power-down step -- don't run it
+	 * while a scan might still be draining). */
+	rm31080_wait_for_scan_finish_blocking(rm);
+	rm31080_cmd_process(rm, 0, rm->krl_tbl[KRL_INDEX_RM_SUSPEND]);
+	rm31080_wait_for_scan_finish_blocking(rm);
+	rm31080_cmd_process(rm, 1, rm->krl_tbl[KRL_INDEX_RM_SUSPEND]);
+
+	rm31080_release_all_touches(rm);
+
+	/* spi_locked=1 is the LAST thing rm_ctrl_suspend() does -- locked
+	 * on the way down, re-locked on the way back up in resume below,
+	 * and only released once userspace confirms reinit is done via
+	 * RM_VARIABLE_SET_SPI_UNLOCK (gated by resume_cnt, see above). */
+	rm->spi_locked = true;
+
 	rm31080_send_signal(rm, RM_SIGNAL_SUSPEND);
 	return 0;
 }
@@ -2423,7 +2597,28 @@ static int __maybe_unused rm31080_resume(struct device *dev)
 {
 	struct rm31080_data *rm = dev_get_drvdata(dev);
 
+	/* rm_ctrl_resume(): spi_locked=1 is the FIRST thing set, before any
+	 * of the state resets or the resume table run below. */
+	rm->spi_locked = true;
 	rm->is_suspended = false;
+	rm->resume_cnt++;
+
+	/* rm_tch_init_ts_structure_part(), the parts that apply to our
+	 * architecture (see the NOTE above the function block for what's
+	 * excluded and why). */
+	rm->init_finished = false;	/* b_init_finish = 0 */
+	rm->calc_finished = false;	/* b_calc_finish = 0 */
+	mutex_lock(&rm->scan_mode_lock);
+	rm->scan_mode_state = RM_SCAN_ACTIVE_MODE;
+	mutex_unlock(&rm->scan_mode_lock);
+	rm->read_para = 0;		/* u16_read_para = 0 */
+	rm->baseline_pending = false;	/* b_bl_updated = false -- any
+					 * SET_BASELINE staged before suspend
+					 * and never flushed via idle-mode
+					 * entry is stale; HAL redoes its own
+					 * init sequence post-resume anyway */
+	rm31080_watchdog_reset(rm, 0);	/* rm_ctrl_watchdog_func(0) */
+
 	/* downstream: wake_lock_active()+wake_unlock() followed by
 	 * wake_lock_timeout() -- __pm_wakeup_event() is the direct modern
 	 * replacement for that exact "start or refresh a bounded wake
