@@ -688,13 +688,22 @@
 	};
 
 	/* MicroSD */
+	/* 
+	 * Downstream DTS has a configuration to also
+	 * use it as UART by the way. Might be interesting
+	 * for any reader here.
+	 */
 	sdmmc3: mmc@700b0400 {
 		status = "okay";
 		bus-width = <4>;
 
-		/* Not tested yet */
-		// sd-uhs-sdr104;
-		// mmc-ddr-1_8v;
+		/* 
+		 * Warning: untested.
+		 * My only microSD card is a Class 4
+		 * one, so I can't test the UHS-I modes.
+		 */
+		sd-uhs-sdr104;
+		mmc-ddr-1_8v;
 
 		cd-gpios = <&gpio TEGRA_GPIO(V, 2) GPIO_ACTIVE_LOW>;
 

@@ -35,7 +35,7 @@ Fully functional:
   oddity.
 * Magnetometer: Asahi Kasei AK8963 (driver: `ak8975`)
 * Motion Tracking: Invensense MPU6515 (driver: `inv-mpu6050-i2c`)
-* SD card slot (not at full potential speed yet)
+* microSD card slot: Enabled, but UHS-I support is untested. At your own risk.
 * Thermal sensors (using `tegra_soctherm` & `generic_adc_thermal`)
 * Voltage Monitor: TI INA3221 (driver: `ina3221`)
 
