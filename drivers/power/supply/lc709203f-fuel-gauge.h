@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+/* SPDX-License-Identifier: GPL-2.0-only */
 
 #ifndef LC709203F_FUEL_GAUGE_H
 #define LC709203F_FUEL_GAUGE_H
@@ -26,6 +26,13 @@
 /* Battery temperature source, written to LC709203F_REG_STATUS_BIT */
 #define LC709203F_TEMP_MODE_I2C		0x0000
 #define LC709203F_TEMP_MODE_THERMISTOR		0x0001
+
+/*
+ * Written to LC709203F_REG_IC_POWER_MODE. Some packages auto-sleep
+ * after init, which stops RSOC tracking -- we force Operational mode.
+ */
+#define LC709203F_POWER_MODE_OPERATIONAL	0x0001
+#define LC709203F_POWER_MODE_SLEEP		0x0002
 
 /*
  * Magic "quickstart" value for LC709203F_REG_INITIAL_RSOC. Writing this
@@ -62,6 +69,11 @@ struct lc709203f_chip {
 	u32 appli_adjustment;
 	u32 battery_profile;
 	bool has_thermistor;
+	/*
+	 * Whether "onnn,battery-profile" was set in DT; 0x0000 is a
+	 * valid value, so "0" can't mean "unset".
+	 */
+	bool has_battery_profile;
 };
 
 static enum power_supply_property lc709203f_props_base[] = {

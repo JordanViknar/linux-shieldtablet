@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: GPL-2.0
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/onnn,lc709203f.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ON Semiconductor LC709203F fuel gauge
+
+maintainers:
+  - JordanViknar <jordanviknar@gmail.com>
+
+description:
+  The LC709203F is a single-cell Li-ion/polymer battery fuel gauge that
+  reports RSOC (relative state of charge) using ON Semiconductor's HG-CVR
+  algorithm. It has no coulomb-counter shunt of its own; boards that want
+  charge/discharge current must route a separate ADC channel to it.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: onnn,lc709203f
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description:
+      ALARMB pin (open-drain, active low). Fires when RSOC or cell voltage
+      drops below the threshold set by onnn,alert-low-rsoc /
+      onnn,alert-low-voltage.
+
+  io-channels:
+    maxItems: 1
+    description:
+      Optional current-sense ADC channel, named "battery-current" via
+      io-channel-names. The chip cannot measure current itself; without
+      this channel, charge/discharge status is inferred from whether the
+      supply is externally powered rather than from actual current.
+
+  io-channel-names:
+    const: battery-current
+
+  onnn,thermistor-beta:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      B-constant of the thermistor connected to the TSENSE/TSW pins.
+      Presence of this property is what selects Thermistor mode (chip
+      register 0x16 = 1) over the default I2C temperature mode (0x16 =
+      0, temperature fed by the host); omit this property entirely on
+      boards with no thermistor wired to the chip.
+
+  onnn,alert-low-rsoc:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    default: 0
+    description:
+      RSOC percentage (0-100) below which ALARMB is asserted. 0 disables
+      the RSOC alarm.
+
+  onnn,alert-low-voltage:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    default: 0
+    description:
+      Cell voltage in mV below which ALARMB is asserted. 0 disables the
+      voltage alarm.
+
+  onnn,initial-rsoc:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      If present (any non-zero value), forces an RSOC "quickstart"
+      recalculation from the current cell voltage at probe time. Leave
+      unset in normal operation; only needed to force a fresh OCV-based
+      estimate, e.g. after a battery swap.
+
+  onnn,appli-adjustment:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      APA (Adjustment Pack Application) register value for the fitted
+      battery's design capacity, per the datasheet's APA table. Omit to
+      leave the chip's existing APA value untouched.
+
+  onnn,battery-profile:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description:
+      Selects which of the chip's two factory-programmed OCV/RSOC
+      curves to use (register 0x12). Which value is correct depends on
+      the exact LC709203F part number ordered -- see the datasheet's
+      "Battery Profile vs. Register" table. Any write to this register
+      forces a full chip reinitialization identical to a battery
+      reinsertion, discarding whatever RSOC estimate the chip had
+      converged on; omit this property entirely unless you have
+      confirmed which profile your part actually needs, so the driver
+      leaves the chip's existing profile alone.
+
+  power-supplies: true
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        fuel-gauge@b {
+            compatible = "onnn,lc709203f";
+            reg = <0x0b>;
+            interrupt-parent = <&gpio>;
+            interrupts = <80 IRQ_TYPE_LEVEL_LOW>;
+            io-channels = <&ina3221x 0>;
+            io-channel-names = "battery-current";
+            onnn,thermistor-beta = <3435>;
+            onnn,alert-low-rsoc = <0>;
+            onnn,alert-low-voltage = <0>;
+            power-supplies = <&charger>;
+        };
+    };

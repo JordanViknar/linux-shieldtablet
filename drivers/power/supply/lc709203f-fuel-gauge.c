@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Linux power_supply driver for the onsemi (ON Semiconductor) LC709203F
- * battery fuel gauge, connected over I2C.
+ * battery fuel gauge, connected over I2C. Devicetree compatible string
+ * is "onnn,lc709203f" ("onnn" being ON Semiconductor's registered
+ * vendor prefix; downstream/NVIDIA's tree predates that registration
+ * and uses "onsemi," instead).
  *
  * Originally made by JordanViknar <jordanviknar@gmail.com> for linux-tn8
  * (Linux for the NVIDIA SHIELD Tablet)
@@ -212,26 +215,30 @@ static void lc709203f_external_power_changed(struct power_supply *psy)
 }
 
 /*
- * All of these are the "onsemi,*" properties used across the
- * onsemi,lc709203f downstream Linux tree lineage. Your node sets
- * thermistor-beta and alert-low-rsoc/voltage; initial-rsoc,
- * appli-adjustment and battery-profile are supported too (same
- * convention, other boards in that lineage use them) but stay at
- * safe no-op defaults if you don't add them.
+ * "onnn" is the registered devicetree vendor prefix for ON
+ * Semiconductor (see Documentation/devicetree/bindings/vendor-prefixes.yaml).
+ * Downstream/NVIDIA's tree predates that registration and uses
+ * "onsemi,*" for the same properties; this driver uses the correct
+ * "onnn,*" prefix instead. Your node sets thermistor-beta and
+ * alert-low-rsoc/voltage; initial-rsoc, appli-adjustment and
+ * battery-profile are supported too but stay at safe no-op defaults
+ * if you don't add them.
  */
 static void lc709203f_parse_dt(struct i2c_client *client, struct lc709203f_chip *chip)
 {
 	struct device_node *np = client->dev.of_node;
 
-	of_property_read_u32(np, "onsemi,alert-low-rsoc", &chip->alert_low_rsoc);
-	of_property_read_u32(np, "onsemi,alert-low-voltage", &chip->alert_low_voltage);
+	of_property_read_u32(np, "onnn,alert-low-rsoc", &chip->alert_low_rsoc);
+	of_property_read_u32(np, "onnn,alert-low-voltage", &chip->alert_low_voltage);
 
-	chip->has_thermistor = !of_property_read_u32(np, "onsemi,thermistor-beta",
+	chip->has_thermistor = !of_property_read_u32(np, "onnn,thermistor-beta",
 						      &chip->thermistor_beta);
 
-	of_property_read_u32(np, "onsemi,initial-rsoc", &chip->initial_rsoc);
-	of_property_read_u32(np, "onsemi,appli-adjustment", &chip->appli_adjustment);
-	of_property_read_u32(np, "onsemi,battery-profile", &chip->battery_profile);
+	of_property_read_u32(np, "onnn,initial-rsoc", &chip->initial_rsoc);
+	of_property_read_u32(np, "onnn,appli-adjustment", &chip->appli_adjustment);
+
+	chip->has_battery_profile = !of_property_read_u32(np, "onnn,battery-profile",
+							    &chip->battery_profile);
 }
 
 /*
@@ -247,6 +254,12 @@ static int lc709203f_hw_init(struct lc709203f_chip *chip)
 {
 	int ret;
 
+	/* Some packages auto-sleep after init, which stops RSOC tracking. */
+	ret = lc709203f_write_word(chip, LC709203F_REG_IC_POWER_MODE,
+				    LC709203F_POWER_MODE_OPERATIONAL);
+	if (ret < 0)
+		return ret;
+
 	ret = lc709203f_write_word(chip, LC709203F_REG_ALARM_LOW_RSOC, chip->alert_low_rsoc);
 	if (ret < 0)
 		return ret;
@@ -261,9 +274,15 @@ static int lc709203f_hw_init(struct lc709203f_chip *chip)
 			return ret;
 	}
 
-	ret = lc709203f_write_word(chip, LC709203F_REG_BAT_PROFILE, chip->battery_profile);
-	if (ret < 0)
-		return ret;
+	/*
+	 * Any write here forces a full chip reinit (datasheet), wiping
+	 * the converged RSOC estimate -- only write if DT asked for it.
+	 */
+	if (chip->has_battery_profile) {
+		ret = lc709203f_write_word(chip, LC709203F_REG_BAT_PROFILE, chip->battery_profile);
+		if (ret < 0)
+			return ret;
+	}
 
 	if (chip->has_thermistor) {
 		ret = lc709203f_write_word(chip, LC709203F_REG_STATUS_BIT,
@@ -278,7 +297,7 @@ static int lc709203f_hw_init(struct lc709203f_chip *chip)
 
 	/*
 	 * Quickstart: chip->initial_rsoc is just a "do it or don't" flag
-	 * from devicetree (onsemi,initial-rsoc). The value actually
+	 * from devicetree (onnn,initial-rsoc). The value actually
 	 * written must be the fixed LC709203F_INIT_RSOC_VAL magic word --
 	 * anything else is not a recognized command and won't trigger a
 	 * recalculation. Left unset (0) by default.
@@ -436,7 +455,7 @@ static SIMPLE_DEV_PM_OPS(lc709203f_pm_ops, lc709203f_suspend, lc709203f_resume);
 
 /* Device tree bindings */
 static const struct of_device_id lc709203f_of_match[] = {
-	{ .compatible = "onsemi,lc709203f" },
+	{ .compatible = "onnn,lc709203f" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, lc709203f_of_match);

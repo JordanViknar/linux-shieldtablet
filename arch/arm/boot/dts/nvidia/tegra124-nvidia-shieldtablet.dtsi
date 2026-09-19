@@ -292,7 +292,7 @@
 		// max17048@36 mentioned in downstream DTS but disabled.
 
 		fuel_gauge: fuel-gauge@0b {
-			compatible = "onsemi,lc709203f"; // CONFIG_FUEL_GAUGE_LC709203F
+			compatible = "onnn,lc709203f"; // CONFIG_FUEL_GAUGE_LC709203F
 			reg = <0x0b>;
 
 			interrupt-parent = <&gpio>;
@@ -301,9 +301,9 @@
 			// Add monitored-battery ?
 			power-supplies = <&charger>;
 
-			onsemi,thermistor-beta = <3435>;
-			onsemi,alert-low-rsoc = <0>;
-			onsemi,alert-low-voltage = <0>;
+			onnn,thermistor-beta = <3435>;
+			onnn,alert-low-rsoc = <0>;
+			onnn,alert-low-voltage = <0>;
 		};
 
 		charger: charger@6b {
