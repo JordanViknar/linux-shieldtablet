@@ -188,7 +188,7 @@
 	};
 
 	/* Bluetooth */
-	/* UNFINISHED */
+	/* WILL NEED SOME CLEANING UP */
 	uartc: serial@70006200 {
 		compatible = "nvidia,tegra124-hsuart", "nvidia,tegra30-hsuart"; // CONFIG_SERIAL_TEGRA
 		reset-names = "serial";
@@ -203,8 +203,8 @@
 			compatible = "brcm,bcm43241b0-bt", "brcm,bcm4334-bt"; // CONFIG_BT_HCIUART_BCM
 			max-speed = <4000000>;
 
-			clocks = <&tegra_pmc TEGRA_PMC_CLK_BLINK>;
-			clock-names = "txco";
+			clocks = <&clk32kgaudio_pmic>;
+			clock-names = "lpo";
 
 			interrupt-parent = <&gpio>;
 			interrupts = <TEGRA_GPIO(U, 6) IRQ_TYPE_EDGE_RISING>;
@@ -408,7 +408,11 @@
 				#clock-cells = <0>;
 			};
 
-			palmas_clk32k@1 {
+			/*
+			 * Do not be fooled by its name, it is used
+			 * here for Wi-Fi and Bluetooth, not audio.
+			 */
+			clk32kgaudio_pmic: palmas-clk32k@1 {
 				compatible = "ti,palmas-clk32kgaudio"; // CONFIG_COMMON_CLK_PALMAS
 				#clock-cells = <0>;
 			};
@@ -504,8 +508,8 @@
 					/* 1.8V I/O rail (SMPS8) */
 					palmas_smps8_reg: smps8 {
 						regulator-name = "vdd-1v8";
-						//regulator-min-microvolt = <1800000>;
-						//regulator-max-microvolt = <1800000>;
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <1800000>;
 						regulator-always-on;
 						regulator-boot-on;
 					};
@@ -662,7 +666,7 @@
 	};
 
 	/* Wi-Fi */
-	/* UNFINISHED */
+	/* WILL NEED SOME CLEANING UP */
 	sdmmc1: mmc@700b0000 {
 		status = "okay";
 
@@ -835,15 +839,16 @@
 	brcm_wifi_pwrseq: pwrseq-wifi {
 		compatible = "mmc-pwrseq-simple"; // CONFIG_PWRSEQ_SIMPLE
 
-		clocks = <&tegra_pmc TEGRA_PMC_CLK_BLINK>;
+		clocks = <&clk32kgaudio_pmic>;
 		clock-names = "ext_clock";
 
-		reset-gpios = <&gpio TEGRA_GPIO(X, 7) GPIO_ACTIVE_LOW>;
+		reset-gpios = <&gpio TEGRA_GPIO(X, 7) GPIO_ACTIVE_LOW>,
+					<&gpio TEGRA_GPIO(CC, 5) GPIO_ACTIVE_LOW>;
 		post-power-on-delay-ms = <300>;
 		power-off-delay-us = <300>;
 	};
 
-	// --- Regulators ---
+	// --- REGULATORS ---
 
 	vdd_ac_bat_reg: regulator-acbat {
 		compatible = "regulator-fixed"; // CONFIG_REGULATOR_FIXED_VOLTAGE
