@@ -68,9 +68,29 @@
 #define   UHSIC_PHY_ENABLE			BIT(19)
 
 #define USB_PHY_VBUS_SENSORS			0x404
+#define   B_SESS_VLD_SW_EN			BIT(11)
+#define   B_SESS_VLD_SW_VALUE			BIT(12)
 #define   B_SESS_VLD_WAKEUP_EN			BIT(14)
+#define   A_SESS_VLD_SW_EN			BIT(19)
+#define   A_SESS_VLD_SW_VALUE			BIT(20)
 #define   A_SESS_VLD_WAKEUP_EN			BIT(22)
+#define   A_VBUS_VLD_SW_EN			BIT(27)
+#define   A_VBUS_VLD_SW_VALUE			BIT(28)
 #define   A_VBUS_VLD_WAKEUP_EN			BIT(30)
+/*
+ * Software override of the SoC's own VBUS / session-valid comparators.
+ * Needed on boards where VBUS is sensed by a PMIC or charger instead of
+ * the SoC ("nvidia,pmu-vbus-detection"): the comparators then never see
+ * VBUS and, in device mode, the controller never presents itself to the
+ * host. U-Boot (B_SESS_VLD) and the downstream tegra_udc (A_VLD and
+ * A_SESSION_VLD) both do this.
+ */
+#define VBUS_SENSORS_SW_OVERRIDE		(B_SESS_VLD_SW_EN | \
+						 B_SESS_VLD_SW_VALUE | \
+						 A_SESS_VLD_SW_EN | \
+						 A_SESS_VLD_SW_VALUE | \
+						 A_VBUS_VLD_SW_EN | \
+						 A_VBUS_VLD_SW_VALUE)
 
 #define USB_PHY_VBUS_WAKEUP_ID			0x408
 #define   ID_INT_EN				BIT(0)
@@ -621,7 +641,13 @@ static int utmi_phy_power_on(struct tegra_usb_phy *phy)
 		val = readl_relaxed(base + USB_PHY_VBUS_SENSORS);
 		val &= ~(A_VBUS_VLD_WAKEUP_EN | A_SESS_VLD_WAKEUP_EN);
 		val &= ~(B_SESS_VLD_WAKEUP_EN);
+		if (phy->pmu_vbus_detection)
+			val |= VBUS_SENSORS_SW_OVERRIDE;
 		writel_relaxed(val, base + USB_PHY_VBUS_SENSORS);
+
+		dev_dbg(phy->u_phy.dev, "VBUS_SENSORS=%08x (pmu-vbus override %s)\n",
+			readl_relaxed(base + USB_PHY_VBUS_SENSORS),
+			phy->pmu_vbus_detection ? "on" : "off");
 
 		val = readl_relaxed(base + UTMIP_BAT_CHRG_CFG0);
 		val &= ~UTMIP_PD_CHRG;
@@ -726,6 +752,12 @@ static int utmi_phy_power_off(struct tegra_usb_phy *phy)
 		readl_relaxed_poll_timeout(base + USB_PHY_VBUS_WAKEUP_ID,
 					   val, !(val & VBUS_WAKEUP_STS),
 					   5000, 100000);
+
+	if (phy->pmu_vbus_detection) {
+		val = readl_relaxed(base + USB_PHY_VBUS_SENSORS);
+		val &= ~VBUS_SENSORS_SW_OVERRIDE;
+		writel_relaxed(val, base + USB_PHY_VBUS_SENSORS);
+	}
 
 	utmi_phy_clk_disable(phy);
 
@@ -1523,6 +1555,9 @@ static int tegra_usb_phy_probe(struct platform_device *pdev)
 
 	tegra_phy->is_legacy_phy =
 		of_property_read_bool(np, "nvidia,has-legacy-mode");
+
+	tegra_phy->pmu_vbus_detection =
+		of_property_read_bool(np, "nvidia,pmu-vbus-detection");
 
 	if (of_property_present(np, "dr_mode"))
 		tegra_phy->mode = usb_get_dr_mode(&pdev->dev);

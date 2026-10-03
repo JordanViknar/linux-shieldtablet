@@ -126,6 +126,16 @@ properties:
       the devices that are always connected. e.g. modem.
     type: boolean
 
+  nvidia,pmu-vbus-detection:
+    description: |
+      Indicates that VBUS presence is sensed by an external PMIC or charger
+      instead of by the SoC's own VBUS comparators (which are then not
+      connected to the actual VBUS). The driver forces the SoC's VBUS and
+      session-valid inputs to "valid" while the PHY is powered in device
+      or OTG mode; the role and VBUS state must then come from an external
+      source such as extcon. Only meaningful for UTMI PHYs.
+    type: boolean
+
   nvidia,has-utmi-pad-registers:
     description: |
       Indicates whether this controller contains the UTMI pad control

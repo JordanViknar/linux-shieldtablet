@@ -418,6 +418,19 @@ static int ci_hdrc_alloc_dma_aligned_buffer(struct urb *urb, gfp_t mem_flags)
 
 	if (urb->num_sgs || urb->sg || urb->transfer_buffer_length == 0)
 		return 0;
+
+	/*
+	 * The caller already mapped this buffer and passed its DMA address in
+	 * urb->transfer_dma (usb-storage does this for everything it sends or
+	 * receives through its iobuf: CBW, CSW, GET_MAX_LUN). Bouncing such an
+	 * URB cannot work: usb_hcd_map_urb_for_dma() does not map anything when
+	 * URB_NO_TRANSFER_DMA_MAP is set, so the controller keeps using the
+	 * original buffer, while the copy-back on completion would overwrite the
+	 * received data with the never-written bounce buffer.
+	 */
+	if (urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)
+		return 0;
+
 	if (IS_ALIGNED((uintptr_t)urb->transfer_buffer, 4)
 	    && IS_ALIGNED(urb->transfer_buffer_length, 4))
 		return 0;

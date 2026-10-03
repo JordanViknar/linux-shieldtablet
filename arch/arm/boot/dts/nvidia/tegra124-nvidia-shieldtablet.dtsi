@@ -311,7 +311,7 @@
 			reg = <0x6b>;
 
 			interrupt-parent = <&gpio>;
-			interrupts = <TEGRA_GPIO(J, 0) GPIO_ACTIVE_LOW>;
+			interrupts = <TEGRA_GPIO(J, 0) IRQ_TYPE_EDGE_FALLING>;
 
 			omit-battery-class;
 
@@ -834,6 +834,83 @@
 
 	hda@70030000 {
 		status = "okay";
+	};
+
+	/*
+	 * The only USB port is the micro-AB connector, wired to UTMI PHY 0 of
+	 * the USB1 controller (7d000000). That controller is a ChipIdea core
+	 * and does both host (EHCI) and device mode, so XUSB is not needed
+	 * (downstream used it for host, but the port is USB 2.0 only) and
+	 * its padctl is left disabled.
+	 *
+	 * Nothing on this port is detected by the SoC itself:
+	 *  - ID is on Palmas GPIO0 (pinmux "id" function) and
+	 *  - VBUS presence comes from the Palmas VBUS comparator,
+	 * both surfaced through palmas_extcon. Downstream's extcon-cable-xlate
+	 * takes both "vbus" and "id" from palmas_extcon as well.
+	 * Host mode VBUS is the bq24192's OTG boost (usb0_vbus).
+	 */
+	usb1: usb@7d000000 {
+		compatible = "nvidia,tegra124-udc";
+		status = "okay";
+		dr_mode = "otg";
+
+		/* Don't use the ChipIdea OTG FSM, roles come from extcon */
+		hnp-disable;
+		srp-disable;
+		adp-disable;
+
+		usb-role-switch;
+		extcon = <&palmas_extcon>, <&palmas_extcon>; /* vbus, id */
+		vbus-supply = <&usb0_vbus>;
+
+		port {
+			usb_in: endpoint {
+				remote-endpoint = <&connector_out>;
+			};
+		};
+	};
+
+	usb-phy@7d000000 {
+		status = "okay";
+		dr_mode = "otg";
+
+		vbus-supply = <&ldousb_reg>;
+		
+		/*
+		 * Note to self :
+		 * Downstream `xcvr-use-fuses` != Mainline `xcvr-setup-use-fuses`
+		 * Downstream reads the calibration fuse in software and programs
+		 * XCVR_SETUP itself while mainline skips programming XCVR_SETUP
+		 * and relies on the Tegra20/30 FUSE_SETUP_SEL hardware path.
+		 */
+		nvidia,xcvr-setup = <15>;
+		nvidia,xcvr-lsfslew = <2>;
+		nvidia,xcvr-lsrslew = <2>;
+
+		/*
+		 * VBUS is sensed by the PMIC, not by the SoC: tell the PHY driver
+		 * to force the SoC's VBUS/session-valid inputs (see
+		 * drivers/usb/phy/phy-tegra-usb.c). Without this, device mode
+		 * comes up but a host never sees the tablet.
+		 */
+		nvidia,pmu-vbus-detection;
+	};
+
+	padctl@7009f000 {
+		status = "disabled";
+	};
+
+	connector {
+		compatible = "usb-b-connector";
+		label = "micro-USB";
+		type = "micro";
+
+		port {
+			connector_out: endpoint {
+				remote-endpoint = <&usb_in>;
+			};
+		};
 	};
 
 	brcm_wifi_pwrseq: pwrseq-wifi {
